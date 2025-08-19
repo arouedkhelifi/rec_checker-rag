@@ -8,17 +8,16 @@ import logging
 
 # Import your existing RAG code
 from rag_generate import (
-    retrieve_node, 
     generate_node, 
     detect_language,
     analyze_code_metrics,
     analyze_dependencies,
     load_resources,
+    mmr_search,
     DEFAULT_INDEX_PATH,
     DEFAULT_METADATA_PATH,
     DEFAULT_MODEL,
-    AgentState,
-    mmr_search  # Import mmr_search to patch it if needed
+    AgentState
 )
 
 # Configure logging
@@ -50,6 +49,54 @@ class CodeProcessResponse(BaseModel):
 index = None
 metadatas = None
 embedding_model = None
+
+def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
+    """
+    Custom retrieve node that accepts resources as parameters instead of using globals.
+    
+    Args:
+        state (AgentState): Current agent state containing code and language info.
+        index_ref: FAISS index object
+        metadatas_ref: Metadata list
+        embedding_model_ref: Embedding model object
+    
+    Returns:
+        AgentState: Updated state with retrieved recommendation chunks, metrics, and dependencies.
+    """
+    logger.debug(f"mmr_search function defined at: {mmr_search.__code__.co_filename}:{mmr_search.__code__.co_firstlineno}")
+    
+    # Extract snippet of code (currently unused here but could be for future)
+    code_sample = state["code"][:1000]
+    
+    language = state["code_language"]
+    # Construct the query focusing on performance, efficiency, and environmental impact
+    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    logger.debug(f"Retrieval query: {query}")
+    
+    try:
+        # Perform MMR search on index to get relevant chunks - using passed resources
+        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
+        logger.debug(f"Retrieved {len(retrieved)} chunks from mmr_search")
+        
+        # Filter retrieved chunks by score threshold and limit results
+        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        logger.debug(f"Filtered to {len(filtered)} chunks with score > 0.3")
+        
+        # Save filtered chunks into state
+        state["retrieved_chunks"] = filtered
+        
+        # Analyze code metrics and add to state
+        state["metrics"] = analyze_code_metrics(state["code"], language)
+        
+        # Analyze code dependencies and add to state
+        state["dependencies"] = analyze_dependencies(state["code"], language)
+        
+    except Exception as e:
+        # On failure, log and store error info in state
+        state["error"] = f"Error during retrieval: {str(e)}"
+        logger.error(f"Retrieval error: {e}")
+    
+    return state
 
 # Load resources on startup
 @app.on_event("startup")
@@ -116,33 +163,9 @@ async def process_code(request: CodeProcessRequest):
             "target_language": request.target_language
         }
         
-        # Create a custom retrieve_node function that has access to our resources
-        def custom_retrieve_node(state: AgentState) -> AgentState:
-            """
-            A wrapper around retrieve_node that provides the necessary resources
-            """
-            # Create a patched mmr_search function that uses our loaded resources
-            original_mmr_search = mmr_search
-            
-            def patched_mmr_search(query, code_language, *args, **kwargs):
-                # Use our loaded resources
-                return original_mmr_search(query, code_language, index, metadatas, embedding_model, *args, **kwargs)
-            
-            # Temporarily replace the mmr_search function
-            import rag_generate
-            original_func = rag_generate.mmr_search
-            rag_generate.mmr_search = patched_mmr_search
-            
-            try:
-                # Call the original retrieve_node
-                return retrieve_node(state)
-            finally:
-                # Restore the original function
-                rag_generate.mmr_search = original_func
-        
-        # Process through our custom retrieve node
+        # Process through our custom retrieve node with explicit resource passing
         logger.info(f"Running retrieve node for {request.filename}")
-        state_after_retrieve = custom_retrieve_node(initial_state)
+        state_after_retrieve = custom_retrieve_node(initial_state, index, metadatas, embedding_model)
         
         # Process through generate node
         logger.info(f"Running generate node for {request.filename}")
@@ -178,6 +201,6 @@ async def root():
     }
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(5000)
     # Use uvicorn directly instead of app.run()
     uvicorn.run("server:app", host="127.0.0.1", port=port, reload=True)
