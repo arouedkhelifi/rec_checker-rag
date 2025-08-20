@@ -63,6 +63,13 @@ class Config:
     MAX_SESSIONS: int = int(os.getenv("MAX_SESSIONS", "10"))
     DEFAULT_LANGUAGE: str = os.getenv("DEFAULT_LANGUAGE", "English")
     
+    # Large file processing settings
+    MAX_FILE_SIZE_CHARS: int = int(os.getenv("MAX_FILE_SIZE_CHARS", "1000000"))  # 1M chars
+    CHUNK_SIZE_CHARS: int = int(os.getenv("CHUNK_SIZE_CHARS", "50000"))  # 50K chars per chunk
+    CHUNK_OVERLAP_CHARS: int = int(os.getenv("CHUNK_OVERLAP_CHARS", "5000"))  # 5K overlap
+    MAX_CHUNKS_PER_FILE: int = int(os.getenv("MAX_CHUNKS_PER_FILE", "20"))  # Max chunks to process
+    PARALLEL_CHUNK_PROCESSING: bool = os.getenv("PARALLEL_CHUNK_PROCESSING", "true").lower() == "true"
+    
     def _validate_required_env_vars(self):
         """Validate that required environment variables are set."""
         required_vars = []

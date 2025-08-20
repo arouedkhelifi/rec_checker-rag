@@ -42,6 +42,7 @@ RESPONSE_CACHE = {}
 index = None
 metadatas = None
 embedding_model = None
+agent = None
 
 # Language detection patterns (keeping existing patterns)
 LANGUAGE_PATTERNS = {
@@ -110,10 +111,13 @@ class AgentState(TypedDict):
 def load_resources(index_path: str = None, metadata_path: str = None, model_name: str = None):
     """
     Load the FAISS index, metadata JSON, and the embedding model using config.
+    Enhanced with forced fallback mechanism.
     """
     index_path = index_path or config.VECTOR_INDEX_PATH
     metadata_path = metadata_path or config.VECTOR_METADATA_PATH
     model_name = model_name or config.EMBEDDING_MODEL
+    
+    DEFAULT_FALLBACK_MODEL = "all-MiniLM-L6-v2"
     
     logger.info(f"📦 Loading FAISS index from {index_path}")
     try:
@@ -121,19 +125,52 @@ def load_resources(index_path: str = None, metadata_path: str = None, model_name
         with open(metadata_path, encoding="utf-8") as f:
             data = json.load(f)
         metadatas = data["chunks"] if isinstance(data, dict) and "chunks" in data else data
+        
+        # Always load fallback model first as safety net
+        logger.info(f"🔄 Loading fallback model first: {DEFAULT_FALLBACK_MODEL}")
+        fallback_model = SentenceTransformer(DEFAULT_FALLBACK_MODEL)
+        test_embedding = fallback_model.encode("test")
+        logger.info(f"✅ Fallback embedding model loaded successfully: {DEFAULT_FALLBACK_MODEL}")
+        
+        # Try to load the specified embedding model
+        primary_model = None
+        
         if model_name and model_name.startswith("vertex_ai/"):
-            # Use custom proxy embedding model
-            from embedding_client import ProxyEmbeddingModel
-            embedding_model = ProxyEmbeddingModel(model_name)
-        else:
-            # Use standard SentenceTransformer
-            embedding_model = SentenceTransformer(model_name)
+            logger.info(f"🔄 Attempting to load Vertex AI embedding model: {model_name}")
+            try:
+                # Try custom proxy embedding model
+                from embedding_client import ProxyEmbeddingModel
+                primary_model = ProxyEmbeddingModel(model_name)
+                
+                # Test the model with a simple encode
+                test_embedding = primary_model.encode("test")
+                if test_embedding is not None and len(test_embedding) > 0:
+                    logger.info(f"✅ Vertex AI embedding model loaded successfully: {model_name}")
+                else:
+                    raise Exception("Test encoding returned empty result")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to load Vertex AI embedding model: {e}")
+                logger.info(f"🔄 Falling back to default model: {DEFAULT_FALLBACK_MODEL}")
+                primary_model = None
+        
+        # Use primary model if available, otherwise use fallback
+        embedding_model = primary_model if primary_model is not None else fallback_model
+        
+        # FORCE FALLBACK: If we're in a problematic state, always use fallback
+        # This addresses the parallel processing issue where Vertex AI models become None
+        if model_name and model_name.startswith("vertex_ai/"):
+            logger.warning("🔄 FORCING fallback model due to known Vertex AI threading issues")
+            embedding_model = fallback_model
+        
         logger.info(f"✅ Resources loaded: {index.ntotal} vectors")
+        logger.info(f"📋 Final embedding model: {type(embedding_model).__name__}")
+        
         return index, metadatas, embedding_model
+        
     except Exception as e:
         logger.error(f"❌ Failed to load resources: {e}")
         raise
-
 def detect_language(code: str, filename: str = "") -> str:
     """Detect the programming language of the given code."""
     if filename:
@@ -420,6 +457,33 @@ def retrieve_node(state: AgentState) -> AgentState:
     
     return state
 
+def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
+    """Custom retrieve node that accepts resources as parameters with None check."""
+    code_sample = state["code"][:1000]
+    language = state["code_language"]
+    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    
+    try:
+        # Handle None embedding model by creating fallback
+        if embedding_model_ref is None:
+            logger.warning("Embedding model is None, creating fallback model")
+            from sentence_transformers import SentenceTransformer
+            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("✅ Created fallback embedding model")
+        
+        # Use explicit resource references instead of globals
+        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
+        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        
+        state["retrieved_chunks"] = filtered
+        state["metrics"] = analyze_code_metrics(state["code"], language)
+        state["dependencies"] = analyze_dependencies(state["code"], language)
+        
+    except Exception as e:
+        state["error"] = f"Error during retrieval: {str(e)}"
+        logger.error(f"Retrieval error: {e}")
+    
+    return state
 def generate_node(state: AgentState) -> AgentState:
     """Generate recommendations using the retrieved chunks and code context."""
     if state.get("error"):
@@ -583,6 +647,379 @@ def process_single_chunk(code_chunk: str, language: str, chunk_name: str) -> str
     final_state = agent.invoke(initial_state)
     return final_state["answer"]
 
+# Add this function to rag_generate.py
+
+def process_large_file_upload(file_path: str, target_language: str = "English") -> Dict[str, Any]:
+    """Process large file uploads with intelligent chunking."""
+    from file_processor import file_processor
+    
+    try:
+        # Process file into chunks
+        chunks = file_processor.process_large_file(file_path)
+        
+        if not chunks:
+            return {
+                "recommendations": "No processable code found in the uploaded file.",
+                "language": "unknown",
+                "metrics": {},
+                "dependencies": {}
+            }
+        
+        logger.info(f"Processing {len(chunks)} chunks from large file")
+        
+        # Limit chunks to prevent timeout
+        max_chunks = config.MAX_CHUNKS_PER_FILE
+        if len(chunks) > max_chunks:
+            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
+            chunks = chunks[:max_chunks]
+        
+        # Process chunks in parallel or sequentially
+        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
+            results = process_chunks_parallel(chunks, target_language, index, metadatas, embedding_model, agent)
+        else:
+            results = process_chunks_sequential(chunks, target_language, index, metadatas, embedding_model, agent)
+        
+        # Combine results
+        combined_recommendations = combine_chunk_results(results, chunks)
+        
+        # Calculate overall metrics
+        overall_metrics = calculate_combined_metrics(chunks)
+        
+        return {
+            "recommendations": combined_recommendations,
+            "language": chunks[0]["language"] if chunks else "unknown",
+            "metrics": overall_metrics,
+            "dependencies": {"dependencies": [], "count": 0},
+            "file_info": {
+                "total_chunks": len(chunks),
+                "total_size": sum(c["size"] for c in chunks),
+                "languages": list(set(c["language"] for c in chunks))
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing large file: {e}")
+        return {
+            "recommendations": f"Error processing large file: {str(e)}",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+def process_chunks_sequential(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
+    """Process chunks one by one with explicit resource references."""
+    results = []
+    
+    # Ensure we have all required resources
+    if index_ref is None or metadatas_ref is None:
+        logger.error("Missing required resources (index or metadatas)")
+        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
+    
+    # Create fallback embedding model if needed
+    if embedding_model_ref is None:
+        logger.warning("Creating fallback embedding model for sequential processing")
+        from sentence_transformers import SentenceTransformer
+        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    for i, chunk in enumerate(chunks):
+        logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk['filename']}")
+        
+        try:
+            initial_state: AgentState = {
+                "code": chunk["content"],
+                "code_language": chunk["language"],
+                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
+                "retrieved_chunks": [],
+                "answer": "",
+                "metrics": None,
+                "dependencies": None,
+                "error": None,
+                "target_language": target_language
+            }
+            
+            # Use explicit resource passing with verification
+            state_after_retrieve = custom_retrieve_node_safe(
+                initial_state, 
+                index_ref, 
+                metadatas_ref, 
+                embedding_model_ref
+            )
+            final_state = generate_node(state_after_retrieve)
+            results.append(final_state["answer"])
+            
+        except Exception as e:
+            logger.error(f"Error processing chunk {i}: {e}")
+            results.append(f"Error processing chunk {i}: {str(e)}")
+    
+    return results
+
+def process_chunks_parallel(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
+    """Process chunks in parallel (limited concurrency) with resource verification."""
+    import concurrent.futures
+    
+    # Verify resources before starting parallel processing
+    if index_ref is None or metadatas_ref is None:
+        logger.error("Missing required resources for parallel processing")
+        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
+    
+    # Create fallback embedding model if needed
+    if embedding_model_ref is None:
+        logger.warning("Creating fallback embedding model for parallel processing")
+        from sentence_transformers import SentenceTransformer
+        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    def process_single_chunk(chunk_data):
+        chunk, index = chunk_data
+        try:
+            # Create fresh embedding model for each thread to avoid sharing issues
+            from sentence_transformers import SentenceTransformer
+            thread_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            
+            initial_state: AgentState = {
+                "code": chunk["content"],
+                "code_language": chunk["language"],
+                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
+                "retrieved_chunks": [],
+                "answer": "",
+                "metrics": None,
+                "dependencies": None,
+                "error": None,
+                "target_language": target_language
+            }
+            
+            # Use thread-safe processing with fresh resources
+            state_after_retrieve = custom_retrieve_node_safe(
+                initial_state, 
+                index_ref, 
+                metadatas_ref, 
+                thread_embedding_model
+            )
+            final_state = generate_node(state_after_retrieve)
+            return index, final_state["answer"]
+            
+        except Exception as e:
+            logger.error(f"Error processing chunk {index}: {e}")
+            return index, f"Error processing chunk {index}: {str(e)}"
+    
+    results = [""] * len(chunks)
+    
+    # Use ThreadPoolExecutor with limited workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        chunk_data = [(chunk, i) for i, chunk in enumerate(chunks)]
+        future_to_index = {
+            executor.submit(process_single_chunk, data): data[1] 
+            for data in chunk_data
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_index):
+            try:
+                index, result = future.result()
+                results[index] = result
+            except Exception as e:
+                index = future_to_index[future]
+                results[index] = f"Failed to process chunk {index}: {str(e)}"
+    
+    return results
+
+def custom_retrieve_node_safe(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
+    """Enhanced custom retrieve node with comprehensive safety checks."""
+    code_sample = state["code"][:1000]
+    language = state["code_language"]
+    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    
+    try:
+        # Verify all resources are available
+        if index_ref is None:
+            logger.error("FAISS index is None")
+            state["error"] = "Error during retrieval: FAISS index not available"
+            return state
+            
+        if metadatas_ref is None:
+            logger.error("Metadatas is None")
+            state["error"] = "Error during retrieval: Metadata not available"
+            return state
+            
+        if embedding_model_ref is None:
+            logger.warning("Embedding model is None, creating fallback")
+            from sentence_transformers import SentenceTransformer
+            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Use mmr_search with verified resources
+        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
+        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        
+        state["retrieved_chunks"] = filtered
+        state["metrics"] = analyze_code_metrics(state["code"], language)
+        state["dependencies"] = analyze_dependencies(state["code"], language)
+        
+        if not filtered:
+            logger.warning(f"No relevant chunks found for {language}")
+        
+    except Exception as e:
+        state["error"] = f"Error during retrieval: {str(e)}"
+        logger.error(f"Retrieval error: {e}")
+    
+    return state
+
+def process_large_file_upload_fixed(file_path: str, target_language: str = "English") -> Dict[str, Any]:
+    """Enhanced process large file upload with better resource management."""
+    from file_processor import file_processor
+    
+    # Ensure global resources are loaded
+    global index, metadatas, embedding_model
+    
+    if index is None or metadatas is None:
+        logger.error("Global resources not loaded properly")
+        return {
+            "recommendations": "Error: Vector index or metadata not loaded. Please restart the service.",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+    
+    try:
+        # Process file into chunks
+        chunks = file_processor.process_large_file(file_path)
+        
+        if not chunks:
+            return {
+                "recommendations": "No processable code found in the uploaded file.",
+                "language": "unknown",
+                "metrics": {},
+                "dependencies": {}
+            }
+        
+        logger.info(f"Processing {len(chunks)} chunks from large file")
+        
+        # Limit chunks to prevent timeout
+        max_chunks = config.MAX_CHUNKS_PER_FILE
+        if len(chunks) > max_chunks:
+            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
+            chunks = chunks[:max_chunks]
+        
+        # Create fallback embedding model if needed
+        safe_embedding_model = embedding_model
+        if safe_embedding_model is None:
+            logger.warning("Creating fallback embedding model for large file processing")
+            from sentence_transformers import SentenceTransformer
+            safe_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Process chunks with explicit resource passing
+        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
+            logger.info("Using parallel chunk processing")
+            results = process_chunks_parallel(
+                chunks, target_language, index, metadatas, safe_embedding_model, None
+            )
+        else:
+            logger.info("Using sequential chunk processing")
+            results = process_chunks_sequential(
+                chunks, target_language, index, metadatas, safe_embedding_model, None
+            )
+        
+        # Combine results
+        combined_recommendations = combine_chunk_results(results, chunks)
+        
+        # Calculate overall metrics
+        overall_metrics = calculate_combined_metrics(chunks)
+        
+        return {
+            "recommendations": combined_recommendations,
+            "language": chunks[0]["language"] if chunks else "unknown",
+            "metrics": overall_metrics,
+            "dependencies": {"dependencies": [], "count": 0},
+            "file_info": {
+                "total_chunks": len(chunks),
+                "total_size": sum(c["size"] for c in chunks),
+                "languages": list(set(c["language"] for c in chunks))
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing large file: {e}")
+        return {
+            "recommendations": f"Error processing large file: {str(e)}",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+
+def combine_chunk_results(results: List[str], chunks: List[Dict]) -> str:
+    """Combine individual chunk results into a cohesive report."""
+    combined = "🔍 Large Codebase Analysis Report\n\n"
+    combined += f"📊 **Summary**: Analyzed {len(chunks)} code chunks across multiple files\n\n"
+    
+    # Group by language
+    language_groups = {}
+    for chunk in chunks:
+        lang = chunk["language"]
+        if lang not in language_groups:
+            language_groups[lang] = []
+        language_groups[lang].append(chunk)
+    
+    combined += f"📁 **Languages Found**: {', '.join(language_groups.keys())}\n\n"
+    
+    # Combine results with file context
+    for i, (result, chunk) in enumerate(zip(results, chunks)):
+        if result and result.strip():
+            combined += f"## 📄 {chunk['filename']} (Chunk {chunk['chunk_index']+1}/{chunk['total_chunks']})\n\n"
+            combined += result + "\n\n"
+            combined += "---\n\n"
+    
+    return combined
+
+def calculate_combined_metrics(chunks: List[Dict]) -> Dict[str, Any]:
+    """Calculate overall metrics from all chunks."""
+    total_lines = sum(chunk["content"].count('\n') + 1 for chunk in chunks)
+    total_chars = sum(chunk["size"] for chunk in chunks)
+    
+    return {
+        "total_files": len(set(chunk["filename"] for chunk in chunks)),
+        "total_chunks": len(chunks),
+        "total_lines": total_lines,
+        "total_characters": total_chars,
+        "average_chunk_size": total_chars // len(chunks) if chunks else 0,
+        "languages": list(set(chunk["language"] for chunk in chunks))
+    }
+
+def custom_retrieve_node_safe(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
+    """Enhanced custom retrieve node with comprehensive safety checks."""
+    code_sample = state["code"][:1000]
+    language = state["code_language"]
+    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    
+    try:
+        # Verify all resources are available
+        if index_ref is None:
+            logger.error("FAISS index is None")
+            state["error"] = "Error during retrieval: FAISS index not available"
+            return state
+            
+        if metadatas_ref is None:
+            logger.error("Metadatas is None")
+            state["error"] = "Error during retrieval: Metadata not available"
+            return state
+            
+        if embedding_model_ref is None:
+            logger.warning("Embedding model is None, creating fallback")
+            from sentence_transformers import SentenceTransformer
+            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Use mmr_search with verified resources
+        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
+        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        
+        state["retrieved_chunks"] = filtered
+        state["metrics"] = analyze_code_metrics(state["code"], language)
+        state["dependencies"] = analyze_dependencies(state["code"], language)
+        
+        if not filtered:
+            logger.warning(f"No relevant chunks found for {language}")
+        
+    except Exception as e:
+        state["error"] = f"Error during retrieval: {str(e)}"
+        logger.error(f"Retrieval error: {e}")
+    
+    return state
+
 def build_agent():
     """Build the agent workflow as a state graph."""
     graph = StateGraph(AgentState)
@@ -718,9 +1155,6 @@ css = """
     }
 """
 
-# Keep existing UI and helper functions (create_interface, split_recommendations_by_category, etc.)
-# ... [The rest of the UI functions remain the same]
-
 def main():
     """Main entry point with updated configuration."""
     parser = argparse.ArgumentParser(description="Code Recommendation Checker")
@@ -742,12 +1176,14 @@ def main():
         return 1
 
     # Load resources
-    global index, metadatas, embedding_model
+    global index, metadatas, embedding_model, agent
     index, metadatas, embedding_model = load_resources(args.index, args.metadata, args.embedding_model)
 
     # Build agent
     global agent
     agent = build_agent()
+    logger.info("✅ Agent built and ready")
+
 
     # Launch interface
     logger.info(f"🚀 Starting Gradio interface on port {args.port}")
