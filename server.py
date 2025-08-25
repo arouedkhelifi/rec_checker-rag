@@ -15,6 +15,7 @@ import json
 import logging
 
 # Import updated modules
+from history_manager import history_manager
 from config_manager import config
 from llm_client import llm_client, call_llm
 from rag_generate import (
@@ -64,6 +65,7 @@ class CodeProcessRequest(BaseModel):
     code: str
     filename: Optional[str] = "code_snippet.txt"
     target_language: Optional[str] = "English"
+    save_to_history: Optional[bool] = False
 
 class CodeProcessResponse(BaseModel):
     recommendations: str
@@ -187,26 +189,6 @@ async def get_config():
         version="2.0.0"
     )
 
-# Add these imports to your server.py at the top
-from rag_generate import (
-    detect_language,
-    analyze_code_metrics,
-    analyze_dependencies,
-    load_resources,
-    mmr_search,
-    retrieve_node,
-    generate_node,
-    build_agent,
-    AgentState,
-    process_large_file_upload,
-    # Add these new imports
-    combine_chunk_results,
-    calculate_combined_metrics,
-    custom_retrieve_node_safe,
-)
-
-# Or alternatively, create the function directly in server.py:
-
 @app.post('/process-large-file')
 async def process_large_file(request: Request):
     """Process large file uploads with chunking"""
@@ -231,7 +213,9 @@ async def process_large_file(request: Request):
         body = await request.json()
         file_path = body.get("file_path")
         target_language = body.get("target_language", "English")
-        
+        filename = body.get("filename", os.path.basename(file_path) if file_path else "large_file")
+        save_to_history = body.get("save_to_history", False)
+            
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(status_code=400, detail="Valid file path required")
         
@@ -242,6 +226,20 @@ async def process_large_file(request: Request):
         
         # Process the file directly here instead of calling external function
         result = process_large_file_directly(file_path, target_language, index, metadatas, embedding_model)
+        
+        # Save to history if requested - MOVED HERE AFTER result is defined
+        if save_to_history:
+            # For large files, we don't store the full code content
+            session_id = history_manager.save_session(
+                code=f"Large file processing - {filename} ({os.path.getsize(file_path)} bytes)",
+                recommendations=result["recommendations"],
+                filename=filename,
+                language=result.get("language", "unknown"),
+                metrics=result.get("metrics", {}),
+                pdf_path=None  # Add PDF path if you generate one
+            )
+            logger.info(f"Saved large file analysis to history with ID: {session_id}")
+        
         return result
         
     except Exception as e:
@@ -268,7 +266,7 @@ def process_large_file_directly(file_path: str, target_language: str, index_ref,
         logger.info(f"Processing {len(chunks)} chunks from large file")
         
         # Limit chunks
-        max_chunks = 20
+        max_chunks = 16000
         if len(chunks) > max_chunks:
             logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
             chunks = chunks[:max_chunks]
@@ -587,6 +585,19 @@ async def process_code(request: CodeProcessRequest):
             logger.error(f"Processing error: {final_state['error']}")
             raise HTTPException(status_code=500, detail=final_state["error"])
         
+        # Save to history if requested
+        save_to_history = request.save_to_history
+        if save_to_history:
+            session_id = history_manager.save_session(
+                code=request.code,
+                recommendations=final_state["answer"],
+                filename=request.filename,
+                language=language,
+                metrics=final_state.get("metrics", {}),
+                pdf_path=None  # Add PDF path if you generate one
+            )
+            logger.info(f"Saved analysis to history with ID: {session_id}")
+        
         # Prepare response
         response = CodeProcessResponse(
             recommendations=final_state["answer"],
@@ -605,6 +616,7 @@ async def process_code(request: CodeProcessRequest):
         logger.error(f"Error processing code: {e}")
         logger.exception("Detailed processing error:")
         raise HTTPException(status_code=500, detail=f"Internal processing error: {str(e)}")
+
 
 @app.post('/test-llm')
 async def test_llm_endpoint(request: dict):
@@ -643,32 +655,16 @@ async def get_metrics():
     
     return metrics
 
-# Add these endpoints to your existing server.py
+##history part 
 
 @app.get('/history')
 async def get_history():
-    """Get analysis history from encrypted storage"""
+    """Get analysis history"""
     try:
-        from encryption_utils import decrypt_history
-        
-        history = decrypt_history()
-        
-        # Clean and format history for API response
-        formatted_history = []
-        for item in history:
-            if isinstance(item, dict) and 'id' in item:
-                formatted_history.append({
-                    "id": item.get("id"),
-                    "filename": item.get("id", "unknown"), # id is usually filename
-                    "recommendations": item.get("recommendations", ""),
-                    "timestamp": item.get("timestamp", ""),
-                    "code_preview": item.get("code", "")[:100] + "..." if item.get("code") else "",
-                    "pdf_path": item.get("pdf_path")
-                })
-        
+        history = history_manager.get_all_history()
         return {
-            "history": formatted_history,
-            "count": len(formatted_history)
+            "history": history,
+            "count": len(history)
         }
     except Exception as e:
         logger.error(f"Error getting history: {e}")
@@ -678,24 +674,10 @@ async def get_history():
 async def get_history_item(session_id: str):
     """Get specific history item by session ID"""
     try:
-        from encryption_utils import decrypt_history
-        
-        history = decrypt_history()
-        
-        # Find item by ID
-        for item in history:
-            if isinstance(item, dict) and item.get("id") == session_id:
-                return {
-                    "id": item.get("id"),
-                    "filename": item.get("id"),
-                    "recommendations": item.get("recommendations", ""),
-                    "code": item.get("code", ""),
-                    "pdf_path": item.get("pdf_path"),
-                    "timestamp": item.get("timestamp", "")
-                }
-        
-        raise HTTPException(status_code=404, detail="History item not found")
-        
+        item = history_manager.get_history_item(session_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="History item not found")
+        return item
     except HTTPException:
         raise
     except Exception as e:
@@ -706,21 +688,10 @@ async def get_history_item(session_id: str):
 async def delete_history_item(session_id: str):
     """Delete specific history item"""
     try:
-        from encryption_utils import decrypt_history, save_encrypted_history
-        
-        history = decrypt_history()
-        
-        # Remove item with matching ID
-        updated_history = [item for item in history if item.get("id") != session_id]
-        
-        if len(updated_history) == len(history):
+        success = history_manager.delete_history_item(session_id)
+        if not success:
             raise HTTPException(status_code=404, detail="History item not found")
-        
-        # Save updated history
-        save_encrypted_history(updated_history)
-        
         return {"success": True, "message": "History item deleted"}
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -731,17 +702,25 @@ async def delete_history_item(session_id: str):
 async def clear_history():
     """Clear all history"""
     try:
-        from encryption_utils import save_encrypted_history
-        
-        save_encrypted_history([])  # Save empty history
-        
-        return {"success": True, "message": "All history cleared"}
-        
+        success = history_manager.clear_all_history()
+        return {"success": success, "message": "All history cleared"}
     except Exception as e:
         logger.error(f"Error clearing history: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to clear history: {str(e)}")
 
-
+@app.get('/history/search')
+async def search_history(query: str = ""):
+    """Search history items"""
+    try:
+        results = history_manager.search_history(query)
+        return {
+            "results": results,
+            "count": len(results),
+            "query": query
+        }
+    except Exception as e:
+        logger.error(f"Error searching history: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to search history: {str(e)}")
 
 @app.get('/')
 async def root():

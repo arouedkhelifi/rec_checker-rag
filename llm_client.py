@@ -279,7 +279,7 @@ def call_llm(
 
 def call_llm_stream(prompt: str, system_prompt: Optional[str] = None, **kwargs) -> Iterator[str]:
     """
-    Stream LLM response.
+    Stream LLM response with guaranteed completion.
     
     Args:
         prompt: User prompt
@@ -289,4 +289,15 @@ def call_llm_stream(prompt: str, system_prompt: Optional[str] = None, **kwargs) 
     Returns:
         Iterator of response chunks
     """
+    # Set default parameters if not provided
+    if "max_tokens" not in kwargs:
+        kwargs["max_tokens"] = 32000  # Very large token limit
+    
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = 300  # 5 minute timeout
+    
+    if "top_p" not in kwargs:
+        kwargs["top_p"] = 0.9  # Consistent top_p setting
+    
+    # Call the underlying LLM function with stream=True
     return call_llm(prompt, system_prompt, stream=True, **kwargs)

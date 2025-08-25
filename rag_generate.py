@@ -30,6 +30,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 from fpdf import FPDF
 from reportlab.pdfgen import canvas
+import litellm
+
+# Initialize litellm with your configuration
+config.setup_litellm()
+
+# Use the DEFAULT_LLM property from config
+DEFAULT_LLM = config.DEFAULT_LLM
 
 # Configure logging
 logging.basicConfig(
@@ -201,7 +208,7 @@ def mmr_search(
     top_k=10,
     lambda_param=0.5
 ):
-    """Perform Maximum Marginal Relevance search (keeping existing implementation)."""
+    """Perform Maximum Marginal Relevance search with section info."""
     language_query = f"recommendations for {code_language} code best practices"
     combined_query = f"{query} {language_query}"
     query_vec = embedding_model.encode(combined_query).astype("float32")
@@ -438,7 +445,7 @@ Original recommendations:
         return f"⚠️ Translation failed due to an error: {e}"
 
 def retrieve_node(state: AgentState) -> AgentState:
-    """Retrieve relevant chunks from the knowledge base using MMR search."""
+    """Retrieve relevant chunks from the knowledge base."""
     code_sample = state["code"][:1000]
     language = state["code_language"]
     query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
@@ -446,15 +453,12 @@ def retrieve_node(state: AgentState) -> AgentState:
     try:
         retrieved = mmr_search(query, language, index, metadatas, embedding_model, top_k=7)
         filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        
         state["retrieved_chunks"] = filtered
         state["metrics"] = analyze_code_metrics(state["code"], language)
         state["dependencies"] = analyze_dependencies(state["code"], language)
-        
     except Exception as e:
         state["error"] = f"Error during retrieval: {str(e)}"
         logger.error(f"Retrieval error: {e}")
-    
     return state
 
 def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
@@ -485,21 +489,22 @@ def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_
     
     return state
 def generate_node(state: AgentState) -> AgentState:
-    """Generate recommendations using the retrieved chunks and code context."""
+    """Generate recommendations, including section info in the context."""
     if state.get("error"):
         state["answer"] = f"An error occurred: {state['error']}"
         return state
-        
+
     if not state["retrieved_chunks"]:
         state["answer"] = "No relevant recommendations found for your code."
         return state
 
+    # Format context with section info
     context = "\n\n".join(
         f"[{i+1}] [{c['section']}] {c['text']}" 
         for i, c in enumerate(state["retrieved_chunks"])
     )
-    language, filename = state["code_language"], state["code_filename"]
 
+    language, filename = state["code_language"], state["code_filename"]
     metrics_info = ""
     if state.get("metrics"):
         metrics_info = f"""
@@ -521,91 +526,491 @@ Dependencies ({state['dependencies']['count']}):
             dependencies_info += f"... and {len(state['dependencies']['dependencies']) - 10} more"
 
     prompt = (
-f"## 🧠 ROLE: You are an expert code reviewer specializing in **{language}**.\n"
-f"You are tasked with a deep, professional review of the provided {language} codebase.\n\n"
+        f"## 🧠 ROLE: You are an expert code reviewer specializing in **{language}**.\n"
+        f"You are tasked with a deep, professional review of the provided {language} codebase.\n\n"
+        f"### 📌 Your Evaluation Must Cover:\n"
+        f"1. **Performance** – Evaluate runtime efficiency and computational cost.\n"
+        f"2. **Efficiency** – Look for logic simplification, memory/resource optimization.\n"
+        f"3. **Environmental Impact (Green IT)** – Assess energy consumption, unnecessary loops, heavy I/O, and library bloat.\n"
+        f"4. **Software Design Principles** – Check adherence to SOLID, DRY, separation of concerns, etc.\n"
+        f"5. **Design Patterns** – Identify applied patterns and opportunities for improvements.\n\n"
+        f"Do NOT recommend switching to another language — **unless it is strictly necessary** to achieve substantial gains in performance, efficiency, or environmental impact. Justify clearly.\n"
+        f"Keep all recommendations within the context of {language}.\n"
+        f"---\n"
+        f"## 📘 Best Practice Context:\n{context}\n"
+        f"---\n"
+        f"## 📊 Code Metrics:\n{metrics_info}\n"
+        f"## 📦 Dependencies:\n{dependencies_info}\n"
+        f"## 📁 Folder Structure:\n{state.get('folder_structure', 'N/A')}\n\n"
+        f"## 💻 Provided Code Snippet (Language: {language}):\n```{language}\n{state['code']}\n```\n"
+        f"---\n"
+        f"##  TASK INSTRUCTIONS:\n"
+        f"Please follow the steps below and generate an actionable expert report:\n"
+        f"1. Check each best practice recommendation **against the code and the full project structure**.\n"
+        f"2. For each **violation**:\n"
+        f"   - Explain clearly why it's a violation.\n"
+        f"   - Propose a **specific and actionable fix** (include refactor suggestions where appropriate).\n"
+        f"3. ❗️**Do not list or mention respected recommendations**, even if all best practices are followed.\n"
+        f"4. Analyze the project's **architecture on two levels**:\n"
+        f"   - **Within individual files**: Look at cohesion, structure, responsibility allocation.\n"
+        f"   - **Across the full project**: Assess folder layout, modularity, coupling, and interdependencies.\n"
+        f"   - Are SOLID principles applied properly (esp. SRP, OCP, DIP)?\n"
+        f"   - Recommend any necessary reorganizations (folders, class/file separation, naming, layering).\n"
+        f"5. Evaluate the code's **Green IT impact**:\n"
+        f"   - Identify unnecessary resource consumption (e.g., heavy loops, redundant I/O, memory waste).\n"
+        f"   - Recommend eco-friendly optimizations.\n\n"
+        f"---\n"
+        f"## 📄 OUTPUT FORMAT:\n"
+        f"Start with '🔍 Code Review' as the only title.\n\n"
+        f"First, evaluate individual files:\n"
+        f"For each file with issues, use this format:\n"
+        f"📄 **filename.py**\n\n"
+        f"For each issue category in a file, use this format (only if issues exist):\n"
+        f"🔶 **Performance**\n\n"
+        f"⚠️ **Issue**: [Clear description of the problem]\n\n"
+        f"✅ **Recommendation**: [Specific, actionable solution with code examples when appropriate]\n\n"
+        f"Then, evaluate file architecture:\n"
+        f"🏗️ **File Architecture**\n\n"
+        f"For each file with architectural issues:\n"
+        f"📄 **filename.py**\n\n"
+        f"⚠️ **Issue**: [Clear description of architectural problems within the file]\n\n"
+        f"✅ **Recommendation**: [Specific suggestions for improving file structure, responsibility allocation, etc.]\n\n"
+        f"Finally, evaluate project-level architecture:\n"
+        f"🏢 **Project Architecture**\n\n"
+        f"⚠️ **Issue**: [Clear description of project-level architectural problems]\n\n"
+        f"✅ **Recommendation**: [Specific suggestions for improving folder structure, modularity, file organization, etc.]\n\n"
+        f"Important rules:\n"
+        f"1. Only mention categories where you found issues - skip categories with no violations.\n"
+        f"2. If a whole section (Performance, Efficiency, Green IT, etc.) has no violations, skip that section entirely.\n"
+        f"3. If file architecture is well-designed, skip the File Architecture section.\n"
+        f"4. If project architecture is well-designed, skip the Project Architecture section.\n"
+        f"5. Use emojis and bold text for visual hierarchy instead of markdown headers.\n"
+        f"6. Make sure each section is clearly separated with blank lines for readability.\n"
+        f"7. If no issues are found in the entire codebase, simply write '🔍 Code Review\\n\\nNo issues found in the codebase.'\n"
+        f"8. Format code examples using proper markdown code blocks.\n"
+    )
 
-f"### 📌 Your Evaluation Must Cover:\n"
-f"1. **Performance** – Evaluate runtime efficiency and computational cost.\n"
-f"2. **Efficiency** – Look for logic simplification, memory/resource optimization.\n"
-f"3. **Environmental Impact (Green IT)** – Assess energy consumption, unnecessary loops, heavy I/O, and library bloat.\n"
-f"4. **Software Design Principles** – Check adherence to SOLID, DRY, separation of concerns, etc.\n"
-f"5. **Design Patterns** – Identify applied patterns and opportunities for improvements.\n\n"
-
-f"Do NOT recommend switching to another language – **unless it is strictly necessary** to achieve substantial gains in performance, efficiency, or environmental impact. Justify clearly.\n"
-f"Keep all recommendations within the context of {language}.\n"
-
-f"---\n"
-f"## 📘 Best Practice Context:\n{context}\n"
-f"---\n"
-f"## 📊 Code Metrics:\n{metrics_info}\n"
-f"## 📦 Dependencies:\n{dependencies_info}\n\n"
-
-f"## 💻 Provided Code Snippet (Language: {language}):\n"
-f"```{language}\n{state['code']}\n```\n"
-
-f"---\n"
-f"## 🎯 TASK INSTRUCTIONS:\n"
-f"Please follow the steps below and generate an actionable expert report:\n"
-f"1. Check each best practice recommendation **against the code**.\n"
-f"2. For each **violation**:\n"
-f"   - Explain clearly why it's a violation.\n"
-f"   - Propose a **specific and actionable fix** (include refactor suggestions where appropriate).\n"
-f"3. ⚠️**Do not list or mention respected recommendations**, even if all best practices are followed.\n"
-f"4. Analyze the code's **architecture and design**:\n"
-f"   - Look at cohesion, structure, responsibility allocation.\n"
-f"   - Are SOLID principles applied properly?\n"
-f"   - Recommend any necessary reorganizations.\n"
-f"5. Evaluate the code's **Green IT impact**:\n"
-f"   - Identify unnecessary resource consumption.\n"
-f"   - Recommend eco-friendly optimizations.\n\n"
-
-f"---\n"
-f"## 📄 OUTPUT FORMAT:\n"
-f"Start with '🔍 Code Review' as the only title.\n\n"
-
-f"For each issue category, use this format (only if issues exist):\n"
-f"🔶 **Performance**\n\n"
-
-f"For each specific issue:\n"
-f"⚠️ **Issue**: [Clear description of the problem]\n\n"
-f"✅ **Recommendation**: [Specific, actionable solution with code examples when appropriate]\n\n"
-
-f"Important rules:\n"
-f"1. Only mention categories where you found issues - skip categories with no violations.\n"
-f"2. If no issues are found in the entire codebase, simply write '🔍 Code Review\\n\\nNo issues found in the codebase.'\n"
-f"3. Use emojis and bold text for visual hierarchy.\n"
-f"4. Make sure each section is clearly separated with blank lines for readability.\n"
-f"5. Format code examples using proper markdown code blocks.\n"
-)
-
-    # Append past feedback if available
+    # Append past feedback for the file, if any
     past_feedbacks = get_past_feedback_for_file(filename)
     if past_feedbacks:
         prompt += "\n\n## 📣 Past User Feedback to Consider:\n"
         for fb in past_feedbacks:
             prompt += f"- {fb}\n"
-        prompt += "\nPlease carefully consider the past user feedback above when performing your review.\n"
+        prompt += "\nPlease carefully consider the past user feedback above when performing your review and recommendations.\n"
 
     try:
+        # Initialize answer
         state["answer"] = ""
-        
-        # Use streaming for real-time response
-        system_prompt = f"Expert {language} reviewer focusing on best practices"
-        
-        for chunk in call_llm_stream(prompt, system_prompt, top_p=0.9):
-            if chunk and chunk.strip():
-                state["answer"] += chunk
 
-        # Translate if needed
+        # Stream completions from the LLM and accumulate
+        for chunk in litellm.completion(
+            model=DEFAULT_LLM,
+            messages=[
+                {"role": "system", "content": f"Expert {language} reviewer focusing on best practices"},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=16000,
+            temperature=0.2,
+            top_p=0.9,
+            stream=True
+        ):
+            logger.debug(f"Chunk received: {chunk}")
+            # Extract streamed text content if available
+            if hasattr(chunk, 'choices') and chunk.choices:
+                delta = getattr(chunk.choices[0], 'delta', None)
+                if delta and getattr(delta, 'content', None):
+                    content = delta.content
+                    if isinstance(content, str) and content.strip() != "":
+                        state["answer"] += content
+
+        # Translate answer if target language is specified and not English
         if state.get("target_language") and state["target_language"].lower() != "english":
             state["answer"] = translate_recommendations(state["answer"], state["target_language"])
 
     except Exception as e:
+        # On error, set error message and log
         state["error"] = f"Error during generation: {str(e)}"
         state["answer"] = f"Failed to generate recommendations: {str(e)}"
         logger.error(f"Generation error: {e}")
 
     return state
+
+
+
+
+
+def parallel_process_chunks(code_chunks: List[str], language: str, filename: str) -> str:
+    """Process multiple code chunks in parallel using threads."""
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(code_chunks), 5)) as executor:
+        future_to_chunk = {
+            executor.submit(process_single_chunk, chunk, language, f"{filename} (part {i+1}/{len(code_chunks)})"): i 
+            for i, chunk in enumerate(code_chunks)
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            chunk_idx = future_to_chunk[future]
+            try:
+                result = future.result()
+                results.append((chunk_idx, result))
+            except Exception as e:
+                logger.error(f"Error processing chunk {chunk_idx}: {e}")
+                results.append((chunk_idx, f"Error processing this section: {str(e)}"))
+    
+    sorted_results = [res for _, res in sorted(results, key=lambda x: x[0])]
+    combined = "\n\n## ===== Next Section =====\n\n".join(sorted_results)
+    
+    return combined
+
+def process_single_chunk(code_chunk: str, language: str, chunk_name: str) -> str:
+    """Process a single code chunk by invoking the agent workflow."""
+    initial_state = {
+        "code": code_chunk,
+        "code_language": language,
+        "code_filename": chunk_name,
+        "retrieved_chunks": [],
+        "answer": "",
+        "metrics": None,
+        "dependencies": None,
+        "error": None
+    }
+    
+    final_state = agent.invoke(initial_state)
+    return final_state["answer"]
+
+# Add this function to rag_generate.py
+
+def process_large_file_upload(file_path: str, target_language: str = "English") -> Dict[str, Any]:
+    """Process large file uploads with intelligent chunking."""
+    from file_processor import file_processor
+    
+    try:
+        # Process file into chunks
+        chunks = file_processor.process_large_file(file_path)
+        
+        if not chunks:
+            return {
+                "recommendations": "No processable code found in the uploaded file.",
+                "language": "unknown",
+                "metrics": {},
+                "dependencies": {}
+            }
+        
+        logger.info(f"Processing {len(chunks)} chunks from large file")
+        
+        # Limit chunks to prevent timeout
+        max_chunks = config.MAX_CHUNKS_PER_FILE
+        if len(chunks) > max_chunks:
+            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
+            chunks = chunks[:max_chunks]
+        
+        # Process chunks in parallel or sequentially
+        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
+            results = process_chunks_parallel(chunks, target_language, index, metadatas, embedding_model, agent)
+        else:
+            results = process_chunks_sequential(chunks, target_language, index, metadatas, embedding_model, agent)
+        
+        # Combine results
+        combined_recommendations = combine_chunk_results(results, chunks)
+        
+        # Calculate overall metrics
+        overall_metrics = calculate_combined_metrics(chunks)
+        
+        return {
+            "recommendations": combined_recommendations,
+            "language": chunks[0]["language"] if chunks else "unknown",
+            "metrics": overall_metrics,
+            "dependencies": {"dependencies": [], "count": 0},
+            "file_info": {
+                "total_chunks": len(chunks),
+                "total_size": sum(c["size"] for c in chunks),
+                "languages": list(set(c["language"] for c in chunks))
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing large file: {e}")
+        return {
+            "recommendations": f"Error processing large file: {str(e)}",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+def process_chunks_sequential(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
+    """Process chunks one by one with explicit resource references."""
+    results = []
+    
+    # Ensure we have all required resources
+    if index_ref is None or metadatas_ref is None:
+        logger.error("Missing required resources (index or metadatas)")
+        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
+    
+    # Create fallback embedding model if needed
+    if embedding_model_ref is None:
+        logger.warning("Creating fallback embedding model for sequential processing")
+        from sentence_transformers import SentenceTransformer
+        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    for i, chunk in enumerate(chunks):
+        logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk['filename']}")
+        
+        try:
+            initial_state: AgentState = {
+                "code": chunk["content"],
+                "code_language": chunk["language"],
+                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
+                "retrieved_chunks": [],
+                "answer": "",
+                "metrics": None,
+                "dependencies": None,
+                "error": None,
+                "target_language": target_language
+            }
+            
+            # Use explicit resource passing with verification
+            state_after_retrieve = custom_retrieve_node_safe(
+                initial_state, 
+                index_ref, 
+                metadatas_ref, 
+                embedding_model_ref
+            )
+            final_state = generate_node(state_after_retrieve)
+            results.append(final_state["answer"])
+            
+        except Exception as e:
+            logger.error(f"Error processing chunk {i}: {e}")
+            results.append(f"Error processing chunk {i}: {str(e)}")
+    
+    return results
+
+def process_chunks_parallel(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
+    """Process chunks in parallel (limited concurrency) with resource verification."""
+    import concurrent.futures
+    
+    # Verify resources before starting parallel processing
+    if index_ref is None or metadatas_ref is None:
+        logger.error("Missing required resources for parallel processing")
+        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
+    
+    # Create fallback embedding model if needed
+    if embedding_model_ref is None:
+        logger.warning("Creating fallback embedding model for parallel processing")
+        from sentence_transformers import SentenceTransformer
+        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    def process_single_chunk(chunk_data):
+        chunk, index = chunk_data
+        try:
+            # Create fresh embedding model for each thread to avoid sharing issues
+            from sentence_transformers import SentenceTransformer
+            thread_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            
+            initial_state: AgentState = {
+                "code": chunk["content"],
+                "code_language": chunk["language"],
+                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
+                "retrieved_chunks": [],
+                "answer": "",
+                "metrics": None,
+                "dependencies": None,
+                "error": None,
+                "target_language": target_language
+            }
+            
+            # Use thread-safe processing with fresh resources
+            state_after_retrieve = custom_retrieve_node_safe(
+                initial_state, 
+                index_ref, 
+                metadatas_ref, 
+                thread_embedding_model
+            )
+            final_state = generate_node(state_after_retrieve)
+            return index, final_state["answer"]
+            
+        except Exception as e:
+            logger.error(f"Error processing chunk {index}: {e}")
+            return index, f"Error processing chunk {index}: {str(e)}"
+    
+    results = [""] * len(chunks)
+    
+    # Use ThreadPoolExecutor with limited workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        chunk_data = [(chunk, i) for i, chunk in enumerate(chunks)]
+        future_to_index = {
+            executor.submit(process_single_chunk, data): data[1] 
+            for data in chunk_data
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_index):
+            try:
+                index, result = future.result()
+                results[index] = result
+            except Exception as e:
+                index = future_to_index[future]
+                results[index] = f"Failed to process chunk {index}: {str(e)}"
+    
+    return results
+
+def custom_retrieve_node_safe(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
+    """Enhanced custom retrieve node with comprehensive safety checks."""
+    code_sample = state["code"][:1000]
+    language = state["code_language"]
+    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    
+    try:
+        # Verify all resources are available
+        if index_ref is None:
+            logger.error("FAISS index is None")
+            state["error"] = "Error during retrieval: FAISS index not available"
+            return state
+            
+        if metadatas_ref is None:
+            logger.error("Metadatas is None")
+            state["error"] = "Error during retrieval: Metadata not available"
+            return state
+            
+        if embedding_model_ref is None:
+            logger.warning("Embedding model is None, creating fallback")
+            from sentence_transformers import SentenceTransformer
+            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Use mmr_search with verified resources
+        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
+        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        
+        state["retrieved_chunks"] = filtered
+        state["metrics"] = analyze_code_metrics(state["code"], language)
+        state["dependencies"] = analyze_dependencies(state["code"], language)
+        
+        if not filtered:
+            logger.warning(f"No relevant chunks found for {language}")
+        
+    except Exception as e:
+        state["error"] = f"Error during retrieval: {str(e)}"
+        logger.error(f"Retrieval error: {e}")
+    
+    return state
+
+def process_large_file_upload_fixed(file_path: str, target_language: str = "English") -> Dict[str, Any]:
+    """Enhanced process large file upload with better resource management."""
+    from file_processor import file_processor
+    
+    # Ensure global resources are loaded
+    global index, metadatas, embedding_model
+    
+    if index is None or metadatas is None:
+        logger.error("Global resources not loaded properly")
+        return {
+            "recommendations": "Error: Vector index or metadata not loaded. Please restart the service.",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+    
+    try:
+        # Process file into chunks
+        chunks = file_processor.process_large_file(file_path)
+        
+        if not chunks:
+            return {
+                "recommendations": "No processable code found in the uploaded file.",
+                "language": "unknown",
+                "metrics": {},
+                "dependencies": {}
+            }
+        
+        logger.info(f"Processing {len(chunks)} chunks from large file")
+        
+        # Limit chunks to prevent timeout
+        max_chunks = config.MAX_CHUNKS_PER_FILE
+        if len(chunks) > max_chunks:
+            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
+            chunks = chunks[:max_chunks]
+        
+        # Create fallback embedding model if needed
+        safe_embedding_model = embedding_model
+        if safe_embedding_model is None:
+            logger.warning("Creating fallback embedding model for large file processing")
+            from sentence_transformers import SentenceTransformer
+            safe_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # Process chunks with explicit resource passing
+        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
+            logger.info("Using parallel chunk processing")
+            results = process_chunks_parallel(
+                chunks, target_language, index, metadatas, safe_embedding_model, None
+            )
+        else:
+            logger.info("Using sequential chunk processing")
+            results = process_chunks_sequential(
+                chunks, target_language, index, metadatas, safe_embedding_model, None
+            )
+        
+        # Combine results
+        combined_recommendations = combine_chunk_results(results, chunks)
+        
+        # Calculate overall metrics
+        overall_metrics = calculate_combined_metrics(chunks)
+        
+        return {
+            "recommendations": combined_recommendations,
+            "language": chunks[0]["language"] if chunks else "unknown",
+            "metrics": overall_metrics,
+            "dependencies": {"dependencies": [], "count": 0},
+            "file_info": {
+                "total_chunks": len(chunks),
+                "total_size": sum(c["size"] for c in chunks),
+                "languages": list(set(c["language"] for c in chunks))
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing large file: {e}")
+        return {
+            "recommendations": f"Error processing large file: {str(e)}",
+            "language": "unknown",
+            "metrics": {},
+            "dependencies": {}
+        }
+
+def combine_chunk_results(results: List[str], chunks: List[Dict]) -> str:
+    """Combine individual chunk results into a cohesive report."""
+    combined = "🔍 Large Codebase Analysis Report\n\n"
+    combined += f"📊 **Summary**: Analyzed {len(chunks)} code chunks across multiple files\n\n"
+    
+    # Group by language
+    language_groups = {}
+    for chunk in chunks:
+        lang = chunk["language"]
+        if lang not in language_groups:
+            language_groups[lang] = []
+        language_groups[lang].append(chunk)
+    
+    combined += f"📁 **Languages Found**: {', '.join(language_groups.keys())}\n\n"
+    
+    # Combine results with file context
+    for i, (result, chunk) in enumerate(zip(results, chunks)):
+        if result and result.strip():
+            combined += f"## 📄 {chunk['filename']} (Chunk {chunk['chunk_index']+1}/{chunk['total_chunks']})\n\n"
+            combined += result + "\n\n"
+            combined += "---\n\n"
+    
+    return combined
+
+def calculate_combined_metrics(chunks: List[Dict]) -> Dict[str, Any]:
+    """Calculate overall metrics from all chunks."""
+    total_lines = sum(chunk["content"].count('\n') + 1 for chunk in chunks)
+    total_chars = sum(chunk["size"] for chunk in chunks)
+    
+    return {
+        "total_files": len(set(chunk["filename"] for chunk in chunks)),
+        "total_chunks": len(chunks),
+        "total_lines": total_lines,
+        "total_characters": total_chars,
+        "average_chunk_size": total_chars // len(chunks) if chunks else 0,
+        "languages": list(set(chunk["language"] for chunk in chunks))
+    }
 
 def parallel_process_chunks(code_chunks: List[str], language: str, filename: str) -> str:
     """Process multiple code chunks in parallel using threads."""
@@ -1185,11 +1590,7 @@ def main():
     logger.info("✅ Agent built and ready")
 
 
-    # Launch interface
-    logger.info(f"🚀 Starting Gradio interface on port {args.port}")
-    iface = create_interface()
-    iface.launch(server_port=args.port, share=args.share)
-    return 0
+   
 
 if __name__ == "__main__":
     exit(main())

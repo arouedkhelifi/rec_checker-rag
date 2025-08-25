@@ -3,61 +3,66 @@
 from cryptography.fernet import Fernet
 import json
 import os
-import sqlite3
+import logging
+from pathlib import Path
 from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # === Load env variables ===
 load_dotenv()
 SECRET_KEY = os.environ.get("ENCRYPTION_SECRET")
 
 if not SECRET_KEY:
-    raise ValueError("ENCRYPTION_SECRET is not set. Please define it in your .env file.")
+    # Generate a key if not provided
+    logger.warning("ENCRYPTION_SECRET not found, generating a new one")
+    SECRET_KEY = Fernet.generate_key().decode()
+    logger.info(f"Generated new encryption key: {SECRET_KEY}")
+    # You might want to save this to .env file
 
-fernet = Fernet(SECRET_KEY.encode())
+try:
+    fernet = Fernet(SECRET_KEY.encode())
+except Exception as e:
+    logger.error(f"Invalid encryption key: {e}")
+    # Generate a valid key as fallback
+    SECRET_KEY = Fernet.generate_key().decode()
+    fernet = Fernet(SECRET_KEY.encode())
+    logger.info(f"Using fallback encryption key: {SECRET_KEY}")
 
-DB_PATH = "session_history.db"
-MAX_SESSIONS = 10
-
-# === Init the SQLite DB ===
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS session_history (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                encrypted_data BLOB NOT NULL
-            )
-        """)
-        # Insert empty history if not already set
-        cursor.execute("INSERT OR IGNORE INTO session_history (id, encrypted_data) VALUES (1, ?)",
-                       (fernet.encrypt(json.dumps([]).encode()),))
-        conn.commit()
-
-init_db()
-
-# === Save history ===
-def save_encrypted_history(history):
-    history = history[:MAX_SESSIONS]
-    encrypted = fernet.encrypt(json.dumps(history).encode())
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE session_history SET encrypted_data = ? WHERE id = 1", (encrypted,))
-        conn.commit()
-    print(f"[DEBUG] Saved encrypted history with {len(history)} sessions")
-
-# === Load history ===
-def decrypt_history():
+# === Save history to file ===
+def save_encrypted_history(history, file_path):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT encrypted_data FROM session_history WHERE id = 1")
-            row = cursor.fetchone()
-            if not row:
-                return []
-            decrypted = fernet.decrypt(row[0])
-            history = json.loads(decrypted)
-            print(f"[DEBUG] Loaded history with {len(history)} sessions")
-            return history
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Encrypt and save
+        encrypted = fernet.encrypt(json.dumps(history).encode())
+        with open(file_path, 'wb') as f:
+            f.write(encrypted)
+        logger.info(f"Saved encrypted history with {len(history)} sessions to {file_path}")
+        return True
     except Exception as e:
-        print(f"[DEBUG] Failed to load history: {e}")
+        logger.error(f"Failed to save history: {e}")
+        return False
+
+# === Load history from file ===
+def decrypt_history(file_path):
+    try:
+        # Check if file exists
+        if not os.path.exists(file_path):
+            logger.info(f"History file not found: {file_path}, returning empty history")
+            return []
+        
+        # Read and decrypt
+        with open(file_path, 'rb') as f:
+            encrypted = f.read()
+        
+        decrypted = fernet.decrypt(encrypted)
+        history = json.loads(decrypted)
+        logger.info(f"Loaded history with {len(history)} sessions from {file_path}")
+        return history
+    except Exception as e:
+        logger.error(f"Failed to load history from {file_path}: {e}")
         return []

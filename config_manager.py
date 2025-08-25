@@ -27,7 +27,7 @@ class Config:
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
     LLM_BASE_URL: Optional[str] = os.getenv("LLM_BASE_URL")
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "8000"))
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "16000"))
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     
     # LiteLLM specific configuration
@@ -67,8 +67,14 @@ class Config:
     MAX_FILE_SIZE_CHARS: int = int(os.getenv("MAX_FILE_SIZE_CHARS", "1000000"))  # 1M chars
     CHUNK_SIZE_CHARS: int = int(os.getenv("CHUNK_SIZE_CHARS", "50000"))  # 50K chars per chunk
     CHUNK_OVERLAP_CHARS: int = int(os.getenv("CHUNK_OVERLAP_CHARS", "5000"))  # 5K overlap
-    MAX_CHUNKS_PER_FILE: int = int(os.getenv("MAX_CHUNKS_PER_FILE", "20"))  # Max chunks to process
+    MAX_CHUNKS_PER_FILE: int = int(os.getenv("MAX_CHUNKS_PER_FILE", "16000"))  # Max chunks to process
     PARALLEL_CHUNK_PROCESSING: bool = os.getenv("PARALLEL_CHUNK_PROCESSING", "true").lower() == "true"
+    
+    # Add DEFAULT_LLM property
+    @property
+    def DEFAULT_LLM(self) -> str:
+        """Get the default LLM model identifier for litellm."""
+        return self.effective_llm_model
     
     def _validate_required_env_vars(self):
         """Validate that required environment variables are set."""
