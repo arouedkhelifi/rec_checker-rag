@@ -3,6 +3,10 @@ Large File Processing for RAG System
 
 Handles chunking of large codebases while preserving context and structure.
 """
+import rarfile
+import patoolib    # for .rar, .7z, etc.
+import tarfile     # for .tar, .tar.gz, etc.
+import py7zr       # for .7z files
 
 import os
 import zipfile

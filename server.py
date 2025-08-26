@@ -4,7 +4,7 @@ Updated FastAPI Server with Environment Configuration Support
 This server uses the new configuration system and LLM client
 for company proxy support.
 """
-
+from feedback_utils import analyze_feedback, submit_user_feedback
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,12 +28,13 @@ from rag_generate import (
     generate_node,
     build_agent,
     AgentState,
-    process_large_file_upload_fixed,
+    process_large_file_upload_with_resources,
     custom_retrieve_node_safe,
     combine_chunk_results,
     calculate_combined_metrics,
-    gradio_wrapper,  
+    process_code_and_generate,  # <-- Use this instead of gradio_wrapper
 )
+
 
 import warnings
 warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
@@ -95,45 +96,14 @@ metadatas = None
 embedding_model = None
 agent = None
 
-def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
-    """
-    Custom retrieve node that accepts resources as parameters.
-    """
-    logger.debug(f"Running custom retrieve with provided resources")
-    
-    code_sample = state["code"][:1000]
-    language = state["code_language"]
-    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
-    
-    try:
-        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
-        logger.debug(f"Retrieved {len(retrieved)} chunks from mmr_search")
-        
-        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        logger.debug(f"Filtered to {len(filtered)} chunks with score > 0.3")
-        
-        state["retrieved_chunks"] = filtered
-        state["metrics"] = analyze_code_metrics(state["code"], language)
-        state["dependencies"] = analyze_dependencies(state["code"], language)
-        
-    except Exception as e:
-        state["error"] = f"Error during retrieval: {str(e)}"
-        logger.error(f"Retrieval error: {e}")
-    
-    return state
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize resources and test connections on startup."""
     global index, metadatas, embedding_model, agent
-    
     try:
-        # Test LLM connection first
         logger.info("🔧 Testing LLM connection...")
         test_response = call_llm("Hello, this is a connection test. Please respond with 'Connection OK'.")
         logger.info(f"✅ LLM test response: {test_response}")
-        
-        # Load vector resources
         logger.info(f"📦 Loading resources from {config.VECTOR_INDEX_PATH} and {config.VECTOR_METADATA_PATH}")
         index, metadatas, embedding_model = load_resources(
             config.VECTOR_INDEX_PATH, 
@@ -141,15 +111,12 @@ async def startup_event():
             config.EMBEDDING_MODEL
         )
         logger.info(f"✅ Vector resources loaded successfully: {index.ntotal} vectors")
-        
-        # Build agent
         agent = build_agent()
         logger.info("✅ Agent workflow built successfully")
-        
     except Exception as e:
         logger.error(f"❌ Failed to initialize resources: {e}")
         logger.exception("Detailed startup error:")
-        # Don't exit here, let the service start and report errors in health check
+
 
 @app.get('/health', response_model=HealthResponse)
 async def health_check():
@@ -255,342 +222,48 @@ async def process_large_file(request: Request):
         logger.error(f"Error processing large file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-def process_large_file_directly(file_path: str, target_language: str, index_ref, metadatas_ref, embedding_model_ref):
-    """Process large file directly in server.py to avoid import issues"""
-    try:
-        from file_processor import file_processor
-        from sentence_transformers import SentenceTransformer
-        
-        # Process file into chunks
-        chunks = file_processor.process_large_file(file_path)
-        
-        if not chunks:
-            return {
-                "recommendations": "No processable code found in the uploaded file.",
-                "language": "unknown",
-                "metrics": {},
-                "dependencies": {}
-            }
-        
-        logger.info(f"Processing {len(chunks)} chunks from large file")
-        
-        # Limit chunks
-        max_chunks = 16000
-        if len(chunks) > max_chunks:
-            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
-        
-        # Create safe embedding model
-        safe_embedding_model = embedding_model_ref
-        if safe_embedding_model is None:
-            logger.warning("Creating fallback embedding model")
-            safe_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Process chunks sequentially
-        results = []
-        for i, chunk in enumerate(chunks):
-            logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk['filename']}")
-            
-            try:
-                initial_state: AgentState = {
-                    "code": chunk["content"],
-                    "code_language": chunk["language"],
-                    "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
-                    "retrieved_chunks": [],
-                    "answer": "",
-                    "metrics": None,
-                    "dependencies": None,
-                    "error": None,
-                    "target_language": target_language
-                }
-                
-                # Process with safe retrieve
-                state_after_retrieve = safe_custom_retrieve_node(
-                    initial_state, index_ref, metadatas_ref, safe_embedding_model
-                )
-                final_state = generate_node(state_after_retrieve)
-                results.append(final_state["answer"])
-                
-            except Exception as e:
-                logger.error(f"Error processing chunk {i}: {e}")
-                results.append(f"Error processing chunk {i}: {str(e)}")
-        
-        # Combine results
-        combined = "🔍 Large Codebase Analysis Report\n\n"
-        combined += f"📊 **Summary**: Analyzed {len(chunks)} code chunks across multiple files\n\n"
-        
-        # Group by language
-        language_groups = {}
-        for chunk in chunks:
-            lang = chunk["language"]
-            if lang not in language_groups:
-                language_groups[lang] = []
-            language_groups[lang].append(chunk)
-        
-        combined += f"📁 **Languages Found**: {', '.join(language_groups.keys())}\n\n"
-        
-        # Add results
-        for i, (result, chunk) in enumerate(zip(results, chunks)):
-            if result and result.strip():
-                combined += f"## 📄 {chunk['filename']} (Chunk {chunk['chunk_index']+1}/{chunk.get('total_chunks', 1)})\n\n"
-                combined += result + "\n\n"
-                combined += "---\n\n"
-        
-        # Calculate metrics
-        total_lines = sum(chunk["content"].count('\n') + 1 for chunk in chunks)
-        total_chars = sum(chunk["size"] for chunk in chunks)
-        
-        overall_metrics = {
-            "total_files": len(set(chunk["filename"] for chunk in chunks)),
-            "total_chunks": len(chunks),
-            "total_lines": total_lines,
-            "total_characters": total_chars,
-            "average_chunk_size": total_chars // len(chunks) if chunks else 0,
-            "languages": list(set(chunk["language"] for chunk in chunks))
-        }
-        
-        return {
-            "recommendations": combined,
-            "language": chunks[0]["language"] if chunks else "unknown",
-            "metrics": overall_metrics,
-            "dependencies": {"dependencies": [], "count": 0},
-            "file_info": {
-                "total_chunks": len(chunks),
-                "total_size": sum(c["size"] for c in chunks),
-                "languages": list(set(c["language"] for c in chunks))
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in process_large_file_directly: {e}")
-        return {
-            "recommendations": f"Error processing large file: {str(e)}",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
-
-def safe_custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
-    """Safe custom retrieve node defined in server.py"""
-    code_sample = state["code"][:1000]
-    language = state["code_language"]
-    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
-    
-    try:
-        if index_ref is None:
-            logger.error("FAISS index is None")
-            state["error"] = "Error during retrieval: FAISS index not available"
-            return state
-            
-        if metadatas_ref is None:
-            logger.error("Metadatas is None")
-            state["error"] = "Error during retrieval: Metadata not available"
-            return state
-            
-        if embedding_model_ref is None:
-            logger.warning("Embedding model is None, creating fallback")
-            from sentence_transformers import SentenceTransformer
-            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
-        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        
-        state["retrieved_chunks"] = filtered
-        state["metrics"] = analyze_code_metrics(state["code"], language)
-        state["dependencies"] = analyze_dependencies(state["code"], language)
-        
-    except Exception as e:
-        state["error"] = f"Error during retrieval: {str(e)}"
-        logger.error(f"Retrieval error: {e}")
-    
-    return state
-
-# Add this new function to your rag_generate.py
-def process_large_file_upload_with_resources(
-    file_path: str, 
-    target_language: str = "English",
-    index_param=None,
-    metadatas_param=None, 
-    embedding_model_param=None
-) -> Dict[str, Any]:
-    """Process large file upload with explicit resource parameters."""
-    from file_processor import file_processor
-    
-    # Use provided resources or fall back to globals
-    global index, metadatas, embedding_model
-    
-    index_to_use = index_param if index_param is not None else index
-    metadatas_to_use = metadatas_param if metadatas_param is not None else metadatas
-    embedding_to_use = embedding_model_param if embedding_model_param is not None else embedding_model
-    
-    # Final check for resources
-    if index_to_use is None or metadatas_to_use is None:
-        logger.error("No valid resources available for large file processing")
-        return {
-            "recommendations": "Error: Vector index or metadata not available. Please check server configuration.",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
-    
-    try:
-        # Process file into chunks
-        chunks = file_processor.process_large_file(file_path)
-        
-        if not chunks:
-            return {
-                "recommendations": "No processable code found in the uploaded file.",
-                "language": "unknown",
-                "metrics": {},
-                "dependencies": {}
-            }
-        
-        logger.info(f"Processing {len(chunks)} chunks from large file")
-        
-        # Limit chunks to prevent timeout
-        max_chunks = getattr(config, 'MAX_CHUNKS_PER_FILE', 20)
-        if len(chunks) > max_chunks:
-            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
-        
-        # Create safe embedding model
-        safe_embedding_model = embedding_to_use
-        if safe_embedding_model is None:
-            logger.warning("Creating fallback embedding model for large file processing")
-            from sentence_transformers import SentenceTransformer
-            safe_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Force sequential processing to avoid threading issues
-        logger.info("Using sequential chunk processing for stability")
-        results = process_chunks_sequential_safe(
-            chunks, target_language, index_to_use, metadatas_to_use, safe_embedding_model
-        )
-        
-        # Combine results
-        combined_recommendations = combine_chunk_results(results, chunks)
-        
-        # Calculate overall metrics
-        overall_metrics = calculate_combined_metrics(chunks)
-        
-        return {
-            "recommendations": combined_recommendations,
-            "language": chunks[0]["language"] if chunks else "unknown",
-            "metrics": overall_metrics,
-            "dependencies": {"dependencies": [], "count": 0},
-            "file_info": {
-                "total_chunks": len(chunks),
-                "total_size": sum(c["size"] for c in chunks),
-                "languages": list(set(c["language"] for c in chunks))
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing large file: {e}")
-        return {
-            "recommendations": f"Error processing large file: {str(e)}",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
-
-def process_chunks_sequential_safe(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref) -> List[str]:
-    """Safe sequential processing with verified resources."""
-    results = []
-    
-    # Verify resources
-    if index_ref is None or metadatas_ref is None:
-        logger.error("Missing required resources in sequential processing")
-        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
-    
-    # Create fallback embedding model if needed
-    if embedding_model_ref is None:
-        logger.warning("Creating fallback embedding model for sequential processing")
-        from sentence_transformers import SentenceTransformer
-        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-    
-    for i, chunk in enumerate(chunks):
-        logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk['filename']}")
-        
-        try:
-            initial_state: AgentState = {
-                "code": chunk["content"],
-                "code_language": chunk["language"],
-                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
-                "retrieved_chunks": [],
-                "answer": "",
-                "metrics": None,
-                "dependencies": None,
-                "error": None,
-                "target_language": target_language
-            }
-            
-            # Use safe retrieve with verified resources
-            state_after_retrieve = custom_retrieve_node_safe(
-                initial_state, 
-                index_ref, 
-                metadatas_ref, 
-                embedding_model_ref
-            )
-            final_state = generate_node(state_after_retrieve)
-            results.append(final_state["answer"])
-            
-        except Exception as e:
-            logger.error(f"Error processing chunk {i}: {e}")
-            results.append(f"Error processing chunk {i}: {str(e)}")
-    
-    return results 
-
 @app.post('/process', response_model=CodeProcessResponse)
 async def process_code(request: CodeProcessRequest):
-    """
-    Process code and generate recommendations using gradio_wrapper.
-    """
     try:
         global index, metadatas, embedding_model, agent
-        
-        # Check if resources are loaded
-        if index is None or metadatas is None or embedding_model is None:
+
+        # Ensure resources are loaded
+        if index is None or metadatas is None or embedding_model is None or agent is None:
             logger.error("Resources not loaded, attempting to load them now")
-            try:
-                index, metadatas, embedding_model = load_resources(
-                    config.VECTOR_INDEX_PATH,
-                    config.VECTOR_METADATA_PATH,
-                    config.EMBEDDING_MODEL
-                )
-                if agent is None:
-                    agent = build_agent()
-                logger.info("Resources loaded successfully during request")
-            except Exception as e:
-                logger.error(f"Failed to load resources during request: {e}")
-                raise HTTPException(status_code=503, detail="Service temporarily unavailable - resources not loaded")
-        
+            index, metadatas, embedding_model = load_resources(
+                config.VECTOR_INDEX_PATH,
+                config.VECTOR_METADATA_PATH,
+                config.EMBEDDING_MODEL
+            )
+            agent = build_agent()
+            logger.info("Resources loaded successfully during request")
+
         logger.info(f"Processing code with filename: {request.filename}")
-        
-        # Call gradio_wrapper directly with the code
-        recommendations, metrics, pdf_path = gradio_wrapper(
-            user_file=None,  # No file object for direct code input
+
+        # Use the new main entrypoint
+        result = process_code_and_generate(
+            file=None,
             code_text=request.code,
             target_language=request.target_language
         )
-        
-        logger.info(f"Generated recommendations with {len(recommendations)} characters")
-        
-        # Read the PDF file and encode to base64
+
+        recommendations = result["recommendations"]
+        metrics = result.get("metrics", {})
+        pdf_path = result.get("pdf_path")
+
+        # PDF handling (optional)
         pdf_base64 = None
         if pdf_path and os.path.exists(pdf_path):
+            with open(pdf_path, 'rb') as f:
+                pdf_bytes = f.read()
+            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
             try:
-                with open(pdf_path, 'rb') as f:
-                    pdf_bytes = f.read()
-                pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
-                logger.info(f"Generated PDF with {len(pdf_bytes)} bytes")
-            except Exception as e:
-                logger.error(f"Error reading PDF file: {e}")
-        
-        # Detect language
+                os.unlink(pdf_path)
+            except Exception:
+                pass
+
         language = detect_language(request.code, request.filename)
-        
+
         # Save to history if requested
         if request.save_to_history:
             session_id = history_manager.save_session(
@@ -602,33 +275,24 @@ async def process_code(request: CodeProcessRequest):
                 pdf_path=pdf_path
             )
             logger.info(f"Saved analysis to history with ID: {session_id}")
-        
-        # Clean up temporary PDF file
-        if pdf_path and os.path.exists(pdf_path):
-            try:
-                os.unlink(pdf_path)
-            except Exception as e:
-                logger.warning(f"Failed to delete temporary PDF file: {e}")
-        
-        # Prepare response
+
         response = CodeProcessResponse(
             recommendations=recommendations,
             language=language,
             metrics=metrics,
-            dependencies=metrics.get("Dependencies", {}),
+            dependencies=metrics.get("dependencies", {}),
             pdf_base64=pdf_base64
         )
-        
         logger.info(f"Successfully processed {request.filename}")
         return response
-    
+
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
         logger.error(f"Error processing code: {e}")
         logger.exception("Detailed processing error:")
         raise HTTPException(status_code=500, detail=f"Internal processing error: {str(e)}")
+
 
 
 @app.post('/test-llm')
