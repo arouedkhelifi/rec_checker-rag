@@ -13,6 +13,7 @@ import uvicorn
 import os
 import json
 import logging
+import base64
 
 # Import updated modules
 from history_manager import history_manager
@@ -24,15 +25,14 @@ from rag_generate import (
     analyze_dependencies,
     load_resources,
     mmr_search,
-    retrieve_node,
     generate_node,
     build_agent,
     AgentState,
-    process_large_file_upload,
+    process_large_file_upload_fixed,
     custom_retrieve_node_safe,
     combine_chunk_results,
     calculate_combined_metrics,
-    custom_retrieve_node_safe,
+    gradio_wrapper,  
 )
 
 import warnings
@@ -72,6 +72,7 @@ class CodeProcessResponse(BaseModel):
     language: str
     metrics: Optional[Dict[str, Any]] = None
     dependencies: Optional[Dict[str, Any]] = None
+    pdf_base64: Optional[str] = None  # Add field for PDF content
 
 class HealthResponse(BaseModel):
     status: str
@@ -224,10 +225,18 @@ async def process_large_file(request: Request):
         if file_size > 50 * 1024 * 1024:  # 50MB limit
             raise HTTPException(status_code=400, detail="File too large (max 50MB)")
         
-        # Process the file directly here instead of calling external function
-        result = process_large_file_directly(file_path, target_language, index, metadatas, embedding_model)
+        # Use the process_large_file_upload_with_resources function instead
+        # This explicitly passes the resources to avoid the "missing resources" error
+        logger.info(f"Calling process_large_file_upload_with_resources for {file_path}")
+        result = process_large_file_upload_with_resources(
+            file_path, 
+            target_language,
+            index_param=index,
+            metadatas_param=metadatas,
+            embedding_model_param=embedding_model
+        )
         
-        # Save to history if requested - MOVED HERE AFTER result is defined
+        # Save to history if requested
         if save_to_history:
             # For large files, we don't store the full code content
             session_id = history_manager.save_session(
@@ -245,6 +254,8 @@ async def process_large_file(request: Request):
     except Exception as e:
         logger.error(f"Error processing large file: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 def process_large_file_directly(file_path: str, target_language: str, index_ref, metadatas_ref, embedding_model_ref):
     """Process large file directly in server.py to avoid import issues"""
@@ -534,7 +545,7 @@ def process_chunks_sequential_safe(chunks: List[Dict], target_language: str, ind
 @app.post('/process', response_model=CodeProcessResponse)
 async def process_code(request: CodeProcessRequest):
     """
-    Process code and generate recommendations using the updated system.
+    Process code and generate recommendations using gradio_wrapper.
     """
     try:
         global index, metadatas, embedding_model, agent
@@ -555,55 +566,57 @@ async def process_code(request: CodeProcessRequest):
                 logger.error(f"Failed to load resources during request: {e}")
                 raise HTTPException(status_code=503, detail="Service temporarily unavailable - resources not loaded")
         
+        logger.info(f"Processing code with filename: {request.filename}")
+        
+        # Call gradio_wrapper directly with the code
+        recommendations, metrics, pdf_path = gradio_wrapper(
+            user_file=None,  # No file object for direct code input
+            code_text=request.code,
+            target_language=request.target_language
+        )
+        
+        logger.info(f"Generated recommendations with {len(recommendations)} characters")
+        
+        # Read the PDF file and encode to base64
+        pdf_base64 = None
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                with open(pdf_path, 'rb') as f:
+                    pdf_bytes = f.read()
+                pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+                logger.info(f"Generated PDF with {len(pdf_bytes)} bytes")
+            except Exception as e:
+                logger.error(f"Error reading PDF file: {e}")
+        
         # Detect language
         language = detect_language(request.code, request.filename)
-        logger.info(f"Detected language: {language} for file {request.filename}")
-        
-        # Create initial state
-        initial_state: AgentState = {
-            "code": request.code,
-            "code_language": language,
-            "code_filename": request.filename,
-            "retrieved_chunks": [],
-            "answer": "",
-            "metrics": None,
-            "dependencies": None,
-            "error": None,
-            "target_language": request.target_language
-        }
-        
-        # Process through retrieve node with explicit resource passing
-        logger.info(f"Running retrieve node for {request.filename}")
-        state_after_retrieve = custom_retrieve_node(initial_state, index, metadatas, embedding_model)
-        
-        # Process through generate node
-        logger.info(f"Running generate node for {request.filename}")
-        final_state = generate_node(state_after_retrieve)
-        
-        # Check for errors
-        if final_state.get("error"):
-            logger.error(f"Processing error: {final_state['error']}")
-            raise HTTPException(status_code=500, detail=final_state["error"])
         
         # Save to history if requested
-        save_to_history = request.save_to_history
-        if save_to_history:
+        if request.save_to_history:
             session_id = history_manager.save_session(
                 code=request.code,
-                recommendations=final_state["answer"],
+                recommendations=recommendations,
                 filename=request.filename,
                 language=language,
-                metrics=final_state.get("metrics", {}),
-                pdf_path=None  # Add PDF path if you generate one
+                metrics=metrics,
+                pdf_path=pdf_path
             )
             logger.info(f"Saved analysis to history with ID: {session_id}")
         
+        # Clean up temporary PDF file
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                os.unlink(pdf_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary PDF file: {e}")
+        
         # Prepare response
         response = CodeProcessResponse(
-            recommendations=final_state["answer"],
+            recommendations=recommendations,
             language=language,
-            metrics=final_state.get("metrics", {}),
-            dependencies=final_state.get("dependencies", {})
+            metrics=metrics,
+            dependencies=metrics.get("Dependencies", {}),
+            pdf_base64=pdf_base64
         )
         
         logger.info(f"Successfully processed {request.filename}")

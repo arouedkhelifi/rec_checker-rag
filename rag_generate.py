@@ -5,7 +5,6 @@ Updated to use environment variables and company LLM proxy support.
 """
 import sqlite3
 from db_utils import store_feedback, get_past_feedback_for_file, init_feedback_db
-from encryption_utils import decrypt_history, save_encrypted_history
 from utils import prepare_state_from_input
 from config_manager import config
 from llm_client import llm_client, call_llm, call_llm_stream
@@ -25,7 +24,6 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from langgraph.graph import StateGraph, END
-import gradio as gr
 from tenacity import retry, stop_after_attempt, wait_exponential
 import tempfile
 from fpdf import FPDF
@@ -275,18 +273,20 @@ def mmr_search(
 
     return results
 
-def process_large_code(code: str, max_chunk_size: int = None) -> List[str]:
-    """Split large code files into manageable chunks."""
-    max_chunk_size = max_chunk_size or config.MAX_CHUNK_SIZE
-    
+def process_large_code(code: str, max_chunk_size: int = config.MAX_CHUNK_SIZE) -> List[str]:
+    """
+    Split large code files into manageable chunks for processing,
+    attempting to split at logical boundaries where possible.
+    """
     if len(code) <= max_chunk_size:
         return [code]
 
-    lines = code.splitlines(True)
+    lines = code.splitlines(True)  # keep line endings
     chunks = []
     current_chunk = ""
 
     for line in lines:
+        # Start a new chunk if size limit exceeded
         if len(current_chunk) + len(line) > max_chunk_size:
             if current_chunk:
                 chunks.append(current_chunk)
@@ -294,7 +294,8 @@ def process_large_code(code: str, max_chunk_size: int = None) -> List[str]:
 
         current_chunk += line
 
-    if re.match(r'^\s*$', line) and len(current_chunk) > max_chunk_size * 0.5:
+        # Prefer splitting at blank lines if chunk is large enough
+        if re.match(r'^\s*$', line) and len(current_chunk) > max_chunk_size * 0.5:
             chunks.append(current_chunk)
             current_chunk = ""
 
@@ -445,49 +446,50 @@ Original recommendations:
         return f"⚠️ Translation failed due to an error: {e}"
 
 def retrieve_node(state: AgentState) -> AgentState:
-    """Retrieve relevant chunks from the knowledge base."""
+    """
+    Retrieve relevant chunks from the knowledge base using MMR search.
+    
+    Args:
+        state (AgentState): Current agent state containing code and language info.
+    
+    Returns:
+        AgentState: Updated state with retrieved recommendation chunks, metrics, and dependencies.
+    """
+    logger.debug(f"mmr_search function defined at: {mmr_search.__code__.co_filename}:{mmr_search.__code__.co_firstlineno}")
+    
+    # Extract snippet of code (currently unused here but could be for future)
     code_sample = state["code"][:1000]
+    
     language = state["code_language"]
+    # Construct the query focusing on performance, efficiency, and environmental impact
     query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
+    logger.debug(f"Retrieval query: {query}")
     
     try:
+        # Perform MMR search on index to get relevant chunks
         retrieved = mmr_search(query, language, index, metadatas, embedding_model, top_k=7)
+        logger.debug(f"Retrieved {len(retrieved)} chunks from mmr_search")
+        
+        # Filter retrieved chunks by score threshold and limit results
         filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
+        logger.debug(f"Filtered to {len(filtered)} chunks with score > 0.3")
+        
+        # Save filtered chunks into state
         state["retrieved_chunks"] = filtered
+        
+        # Analyze code metrics and add to state
         state["metrics"] = analyze_code_metrics(state["code"], language)
+        
+        # Analyze code dependencies and add to state
         state["dependencies"] = analyze_dependencies(state["code"], language)
+        
     except Exception as e:
+        # On failure, log and store error info in state
         state["error"] = f"Error during retrieval: {str(e)}"
         logger.error(f"Retrieval error: {e}")
+    
     return state
 
-def custom_retrieve_node(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
-    """Custom retrieve node that accepts resources as parameters with None check."""
-    code_sample = state["code"][:1000]
-    language = state["code_language"]
-    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
-    
-    try:
-        # Handle None embedding model by creating fallback
-        if embedding_model_ref is None:
-            logger.warning("Embedding model is None, creating fallback model")
-            from sentence_transformers import SentenceTransformer
-            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-            logger.info("✅ Created fallback embedding model")
-        
-        # Use explicit resource references instead of globals
-        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
-        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        
-        state["retrieved_chunks"] = filtered
-        state["metrics"] = analyze_code_metrics(state["code"], language)
-        state["dependencies"] = analyze_dependencies(state["code"], language)
-        
-    except Exception as e:
-        state["error"] = f"Error during retrieval: {str(e)}"
-        logger.error(f"Retrieval error: {e}")
-    
-    return state
 def generate_node(state: AgentState) -> AgentState:
     """Generate recommendations, including section info in the context."""
     if state.get("error"):
@@ -609,7 +611,7 @@ Dependencies ({state['dependencies']['count']}):
                 {"role": "system", "content": f"Expert {language} reviewer focusing on best practices"},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=16000,
+            max_tokens=min(4096, config.LLM_MAX_TOKENS),
             temperature=0.2,
             top_p=0.9,
             stream=True
@@ -681,62 +683,7 @@ def process_single_chunk(code_chunk: str, language: str, chunk_name: str) -> str
 
 # Add this function to rag_generate.py
 
-def process_large_file_upload(file_path: str, target_language: str = "English") -> Dict[str, Any]:
-    """Process large file uploads with intelligent chunking."""
-    from file_processor import file_processor
-    
-    try:
-        # Process file into chunks
-        chunks = file_processor.process_large_file(file_path)
-        
-        if not chunks:
-            return {
-                "recommendations": "No processable code found in the uploaded file.",
-                "language": "unknown",
-                "metrics": {},
-                "dependencies": {}
-            }
-        
-        logger.info(f"Processing {len(chunks)} chunks from large file")
-        
-        # Limit chunks to prevent timeout
-        max_chunks = config.MAX_CHUNKS_PER_FILE
-        if len(chunks) > max_chunks:
-            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
-        
-        # Process chunks in parallel or sequentially
-        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
-            results = process_chunks_parallel(chunks, target_language, index, metadatas, embedding_model, agent)
-        else:
-            results = process_chunks_sequential(chunks, target_language, index, metadatas, embedding_model, agent)
-        
-        # Combine results
-        combined_recommendations = combine_chunk_results(results, chunks)
-        
-        # Calculate overall metrics
-        overall_metrics = calculate_combined_metrics(chunks)
-        
-        return {
-            "recommendations": combined_recommendations,
-            "language": chunks[0]["language"] if chunks else "unknown",
-            "metrics": overall_metrics,
-            "dependencies": {"dependencies": [], "count": 0},
-            "file_info": {
-                "total_chunks": len(chunks),
-                "total_size": sum(c["size"] for c in chunks),
-                "languages": list(set(c["language"] for c in chunks))
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing large file: {e}")
-        return {
-            "recommendations": f"Error processing large file: {str(e)}",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
+
 def process_chunks_sequential(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
     """Process chunks one by one with explicit resource references."""
     results = []
@@ -1052,300 +999,8 @@ def process_single_chunk(code_chunk: str, language: str, chunk_name: str) -> str
     final_state = agent.invoke(initial_state)
     return final_state["answer"]
 
-# Add this function to rag_generate.py
 
-def process_large_file_upload(file_path: str, target_language: str = "English") -> Dict[str, Any]:
-    """Process large file uploads with intelligent chunking."""
-    from file_processor import file_processor
     
-    try:
-        # Process file into chunks
-        chunks = file_processor.process_large_file(file_path)
-        
-        if not chunks:
-            return {
-                "recommendations": "No processable code found in the uploaded file.",
-                "language": "unknown",
-                "metrics": {},
-                "dependencies": {}
-            }
-        
-        logger.info(f"Processing {len(chunks)} chunks from large file")
-        
-        # Limit chunks to prevent timeout
-        max_chunks = config.MAX_CHUNKS_PER_FILE
-        if len(chunks) > max_chunks:
-            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
-        
-        # Process chunks in parallel or sequentially
-        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
-            results = process_chunks_parallel(chunks, target_language, index, metadatas, embedding_model, agent)
-        else:
-            results = process_chunks_sequential(chunks, target_language, index, metadatas, embedding_model, agent)
-        
-        # Combine results
-        combined_recommendations = combine_chunk_results(results, chunks)
-        
-        # Calculate overall metrics
-        overall_metrics = calculate_combined_metrics(chunks)
-        
-        return {
-            "recommendations": combined_recommendations,
-            "language": chunks[0]["language"] if chunks else "unknown",
-            "metrics": overall_metrics,
-            "dependencies": {"dependencies": [], "count": 0},
-            "file_info": {
-                "total_chunks": len(chunks),
-                "total_size": sum(c["size"] for c in chunks),
-                "languages": list(set(c["language"] for c in chunks))
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing large file: {e}")
-        return {
-            "recommendations": f"Error processing large file: {str(e)}",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
-def process_chunks_sequential(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
-    """Process chunks one by one with explicit resource references."""
-    results = []
-    
-    # Ensure we have all required resources
-    if index_ref is None or metadatas_ref is None:
-        logger.error("Missing required resources (index or metadatas)")
-        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
-    
-    # Create fallback embedding model if needed
-    if embedding_model_ref is None:
-        logger.warning("Creating fallback embedding model for sequential processing")
-        from sentence_transformers import SentenceTransformer
-        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-    
-    for i, chunk in enumerate(chunks):
-        logger.info(f"Processing chunk {i+1}/{len(chunks)}: {chunk['filename']}")
-        
-        try:
-            initial_state: AgentState = {
-                "code": chunk["content"],
-                "code_language": chunk["language"],
-                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
-                "retrieved_chunks": [],
-                "answer": "",
-                "metrics": None,
-                "dependencies": None,
-                "error": None,
-                "target_language": target_language
-            }
-            
-            # Use explicit resource passing with verification
-            state_after_retrieve = custom_retrieve_node_safe(
-                initial_state, 
-                index_ref, 
-                metadatas_ref, 
-                embedding_model_ref
-            )
-            final_state = generate_node(state_after_retrieve)
-            results.append(final_state["answer"])
-            
-        except Exception as e:
-            logger.error(f"Error processing chunk {i}: {e}")
-            results.append(f"Error processing chunk {i}: {str(e)}")
-    
-    return results
-
-def process_chunks_parallel(chunks: List[Dict], target_language: str, index_ref, metadatas_ref, embedding_model_ref, agent_ref) -> List[str]:
-    """Process chunks in parallel (limited concurrency) with resource verification."""
-    import concurrent.futures
-    
-    # Verify resources before starting parallel processing
-    if index_ref is None or metadatas_ref is None:
-        logger.error("Missing required resources for parallel processing")
-        return [f"Error: Missing vector index or metadata resources" for _ in chunks]
-    
-    # Create fallback embedding model if needed
-    if embedding_model_ref is None:
-        logger.warning("Creating fallback embedding model for parallel processing")
-        from sentence_transformers import SentenceTransformer
-        embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-    
-    def process_single_chunk(chunk_data):
-        chunk, index = chunk_data
-        try:
-            # Create fresh embedding model for each thread to avoid sharing issues
-            from sentence_transformers import SentenceTransformer
-            thread_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-            
-            initial_state: AgentState = {
-                "code": chunk["content"],
-                "code_language": chunk["language"],
-                "code_filename": f"{chunk['filename']} (chunk {chunk['chunk_index']+1})",
-                "retrieved_chunks": [],
-                "answer": "",
-                "metrics": None,
-                "dependencies": None,
-                "error": None,
-                "target_language": target_language
-            }
-            
-            # Use thread-safe processing with fresh resources
-            state_after_retrieve = custom_retrieve_node_safe(
-                initial_state, 
-                index_ref, 
-                metadatas_ref, 
-                thread_embedding_model
-            )
-            final_state = generate_node(state_after_retrieve)
-            return index, final_state["answer"]
-            
-        except Exception as e:
-            logger.error(f"Error processing chunk {index}: {e}")
-            return index, f"Error processing chunk {index}: {str(e)}"
-    
-    results = [""] * len(chunks)
-    
-    # Use ThreadPoolExecutor with limited workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        chunk_data = [(chunk, i) for i, chunk in enumerate(chunks)]
-        future_to_index = {
-            executor.submit(process_single_chunk, data): data[1] 
-            for data in chunk_data
-        }
-        
-        for future in concurrent.futures.as_completed(future_to_index):
-            try:
-                index, result = future.result()
-                results[index] = result
-            except Exception as e:
-                index = future_to_index[future]
-                results[index] = f"Failed to process chunk {index}: {str(e)}"
-    
-    return results
-
-def custom_retrieve_node_safe(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
-    """Enhanced custom retrieve node with comprehensive safety checks."""
-    code_sample = state["code"][:1000]
-    language = state["code_language"]
-    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
-    
-    try:
-        # Verify all resources are available
-        if index_ref is None:
-            logger.error("FAISS index is None")
-            state["error"] = "Error during retrieval: FAISS index not available"
-            return state
-            
-        if metadatas_ref is None:
-            logger.error("Metadatas is None")
-            state["error"] = "Error during retrieval: Metadata not available"
-            return state
-            
-        if embedding_model_ref is None:
-            logger.warning("Embedding model is None, creating fallback")
-            from sentence_transformers import SentenceTransformer
-            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Use mmr_search with verified resources
-        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
-        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        
-        state["retrieved_chunks"] = filtered
-        state["metrics"] = analyze_code_metrics(state["code"], language)
-        state["dependencies"] = analyze_dependencies(state["code"], language)
-        
-        if not filtered:
-            logger.warning(f"No relevant chunks found for {language}")
-        
-    except Exception as e:
-        state["error"] = f"Error during retrieval: {str(e)}"
-        logger.error(f"Retrieval error: {e}")
-    
-    return state
-
-def process_large_file_upload_fixed(file_path: str, target_language: str = "English") -> Dict[str, Any]:
-    """Enhanced process large file upload with better resource management."""
-    from file_processor import file_processor
-    
-    # Ensure global resources are loaded
-    global index, metadatas, embedding_model
-    
-    if index is None or metadatas is None:
-        logger.error("Global resources not loaded properly")
-        return {
-            "recommendations": "Error: Vector index or metadata not loaded. Please restart the service.",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
-    
-    try:
-        # Process file into chunks
-        chunks = file_processor.process_large_file(file_path)
-        
-        if not chunks:
-            return {
-                "recommendations": "No processable code found in the uploaded file.",
-                "language": "unknown",
-                "metrics": {},
-                "dependencies": {}
-            }
-        
-        logger.info(f"Processing {len(chunks)} chunks from large file")
-        
-        # Limit chunks to prevent timeout
-        max_chunks = config.MAX_CHUNKS_PER_FILE
-        if len(chunks) > max_chunks:
-            logger.warning(f"Limiting to first {max_chunks} chunks out of {len(chunks)}")
-            chunks = chunks[:max_chunks]
-        
-        # Create fallback embedding model if needed
-        safe_embedding_model = embedding_model
-        if safe_embedding_model is None:
-            logger.warning("Creating fallback embedding model for large file processing")
-            from sentence_transformers import SentenceTransformer
-            safe_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Process chunks with explicit resource passing
-        if config.PARALLEL_CHUNK_PROCESSING and len(chunks) > 1:
-            logger.info("Using parallel chunk processing")
-            results = process_chunks_parallel(
-                chunks, target_language, index, metadatas, safe_embedding_model, None
-            )
-        else:
-            logger.info("Using sequential chunk processing")
-            results = process_chunks_sequential(
-                chunks, target_language, index, metadatas, safe_embedding_model, None
-            )
-        
-        # Combine results
-        combined_recommendations = combine_chunk_results(results, chunks)
-        
-        # Calculate overall metrics
-        overall_metrics = calculate_combined_metrics(chunks)
-        
-        return {
-            "recommendations": combined_recommendations,
-            "language": chunks[0]["language"] if chunks else "unknown",
-            "metrics": overall_metrics,
-            "dependencies": {"dependencies": [], "count": 0},
-            "file_info": {
-                "total_chunks": len(chunks),
-                "total_size": sum(c["size"] for c in chunks),
-                "languages": list(set(c["language"] for c in chunks))
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing large file: {e}")
-        return {
-            "recommendations": f"Error processing large file: {str(e)}",
-            "language": "unknown",
-            "metrics": {},
-            "dependencies": {}
-        }
 
 def combine_chunk_results(results: List[str], chunks: List[Dict]) -> str:
     """Combine individual chunk results into a cohesive report."""
@@ -1385,45 +1040,7 @@ def calculate_combined_metrics(chunks: List[Dict]) -> Dict[str, Any]:
         "languages": list(set(chunk["language"] for chunk in chunks))
     }
 
-def custom_retrieve_node_safe(state: AgentState, index_ref, metadatas_ref, embedding_model_ref) -> AgentState:
-    """Enhanced custom retrieve node with comprehensive safety checks."""
-    code_sample = state["code"][:1000]
-    language = state["code_language"]
-    query = f"recommendations for {language} code best practices regarding performance, efficiency, and environmental impact"
-    
-    try:
-        # Verify all resources are available
-        if index_ref is None:
-            logger.error("FAISS index is None")
-            state["error"] = "Error during retrieval: FAISS index not available"
-            return state
-            
-        if metadatas_ref is None:
-            logger.error("Metadatas is None")
-            state["error"] = "Error during retrieval: Metadata not available"
-            return state
-            
-        if embedding_model_ref is None:
-            logger.warning("Embedding model is None, creating fallback")
-            from sentence_transformers import SentenceTransformer
-            embedding_model_ref = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Use mmr_search with verified resources
-        retrieved = mmr_search(query, language, index_ref, metadatas_ref, embedding_model_ref, top_k=7)
-        filtered = [c for c in retrieved if c.get("score", 0) > 0.3][:5]
-        
-        state["retrieved_chunks"] = filtered
-        state["metrics"] = analyze_code_metrics(state["code"], language)
-        state["dependencies"] = analyze_dependencies(state["code"], language)
-        
-        if not filtered:
-            logger.warning(f"No relevant chunks found for {language}")
-        
-    except Exception as e:
-        state["error"] = f"Error during retrieval: {str(e)}"
-        logger.error(f"Retrieval error: {e}")
-    
-    return state
+   
 
 def build_agent():
     """Build the agent workflow as a state graph."""
@@ -1530,41 +1147,94 @@ def gradio_wrapper(user_file, code_text=None, target_language="English") -> Tupl
 
 # Initialize feedback database
 init_feedback_db()
+####
+def submit_user_feedback(file, code_text, feedback, rating):
+            if file is not None:
+                try:
+                    # Case 1: file is a file path string (Gradio sometimes passes paths now)
+                    if isinstance(file, str) and os.path.exists(file):
+                        filename = os.path.basename(file)
+                        with open(file, "rb") as f:
+                            raw_bytes = f.read()
+                    
+                    # Case 2: file is an UploadedFile object with .name and .read()
+                    elif hasattr(file, "read"):
+                        filename = getattr(file, "name", "uploaded_file")
+                        file.seek(0)
+                        raw_bytes = file.read()
+                    
+                    else:
+                        return "⚠️ Invalid file object type", "", None
 
-# CSS and UI components (keeping existing CSS)
-css = """
-    .session-grp {
-        display: flex !important;
-        flex-direction: row !important;
-        align-items: center !important;
-        gap: 8px !important;
-        margin-bottom: 8px !important;
+                    # Decode content
+                    try:
+                        code = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        code = raw_bytes.decode("latin-1")
+
+                except Exception as e:
+                    return f"⚠️ Error reading uploaded file: {str(e)}", "", None
+
+            elif code_text:
+                filename = "manual_input"
+                code = code_text
+            else:
+                return "⚠️ No code to provide feedback on", "", None
+
+            # Create unique key
+            file_hash = get_cache_key(code)
+
+            # Analyze feedback
+            analysis = analyze_feedback(feedback)
+
+            if analysis["decision"] == "Accept":
+                store_feedback(
+                    file_hash=file_hash,
+                    filename=filename,
+                    feedback=feedback,
+                    rating=rating,
+                    relevance=analysis["relevance"],
+                    sentiment=analysis["sentiment"],
+                    decision=analysis["decision"],
+                )
+                return "✅ Thanks! Your feedback was accepted and will help improve future results.", "", None
+            else:
+                return "⚠️ Thanks! Your feedback was reviewed but marked not useful by our reviewer.", "", None
+###
+last_result = {"recommendations": "", "metrics": {}, "pdf_path": ""}
+
+def translate_recommendations_plain(recommendations, target_language):
+    if not recommendations:
+        return "No recommendations to translate."
+    return translate_recommendations(recommendations, target_language)
+
+
+
+####
+
+def process_code_and_generate(file=None, code_text=None, lang="English"):
+    """
+    Process code input (file or text), generate recommendations, and return results.
+    This is the main function to call from your new frontend.
+    """
+    # Call your core wrapper
+    recommendations, metrics, pdf_path = gradio_wrapper(file, code_text, lang)
+    
+    # Return the results for further processing
+    return {
+        "recommendations": recommendations,
+        "metrics": metrics,
+        "pdf_path": pdf_path
     }
-    .session-btn {
-        width: 250px;
-    }
-    .del-btn {
-        flex-grow: 1 !important;
-        height: 40px;
-        position: absolute;
-        right: 0px;
-        min-width: 40px !important;
-        max-width: 40px !important;
-    }
-    .empty-row {
-        display: none !important;
-        visibility: hidden !important;
-        height: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important;
-    }
-"""
+
+#####
+
 
 def main():
     """Main entry point with updated configuration."""
     parser = argparse.ArgumentParser(description="Code Recommendation Checker")
-    parser.add_argument('--port', type=int, default=config.SERVER_PORT, help="Port to run the Gradio server on")
-    parser.add_argument('--share', action='store_true', default=config.GRADIO_SHARE, help="Create a shareable link")
+    # parser.add_argument('--port', type=int, default=config.SERVER_PORT, help="Port to run the Gradio server on")
+    # parser.add_argument('--share', action='store_true', default=config.GRADIO_SHARE, help="Create a shareable link")
     parser.add_argument('--index', default=config.VECTOR_INDEX_PATH, help="Path to FAISS index file")
     parser.add_argument('--metadata', default=config.VECTOR_METADATA_PATH, help="Path to metadata JSON file")
     parser.add_argument('--embedding-model', default=config.EMBEDDING_MODEL, help="Embedding model to use")
