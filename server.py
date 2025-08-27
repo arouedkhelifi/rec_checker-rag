@@ -398,6 +398,7 @@ async def search_history(query: str = ""):
     except Exception as e:
         logger.error(f"Error searching history: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search history: {str(e)}")
+    
 
 @app.get('/')
 async def root():

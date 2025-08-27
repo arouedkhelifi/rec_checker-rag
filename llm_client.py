@@ -278,26 +278,15 @@ def call_llm(
         return f"Error: {str(e)}"
 
 def call_llm_stream(prompt: str, system_prompt: Optional[str] = None, **kwargs) -> Iterator[str]:
-    """
-    Stream LLM response with guaranteed completion.
-    
-    Args:
-        prompt: User prompt
-        system_prompt: Optional system prompt
-        **kwargs: Additional parameters
-        
-    Returns:
-        Iterator of response chunks
-    """
-    # Set default parameters if not provided
-    if "max_tokens" not in kwargs:
-        kwargs["max_tokens"] = 32000  # Very large token limit
-    
+    max_tokens = kwargs.pop("max_tokens", None)
+    if max_tokens is None:
+        # pick a safe default relative to your config
+        max_tokens = min(4096, getattr(config, "LLM_MAX_TOKENS", 4096))
+
     if "timeout" not in kwargs:
-        kwargs["timeout"] = 300  # 5 minute timeout
-    
+        kwargs["timeout"] = 300
     if "top_p" not in kwargs:
-        kwargs["top_p"] = 0.9  # Consistent top_p setting
-    
-    # Call the underlying LLM function with stream=True
-    return call_llm(prompt, system_prompt, stream=True, **kwargs)
+        kwargs["top_p"] = 0.9
+
+    return call_llm(prompt, system_prompt, stream=True, max_tokens=max_tokens, **kwargs)
+
